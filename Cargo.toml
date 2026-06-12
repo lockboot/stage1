@@ -1,5 +1,10 @@
 [workspace]
 members = ["crates/stage1", "crates/example-stage2"]
+# stage0 is a UEFI (no_std, *-unknown-uefi) application and cannot be built for
+# the musl target this workspace defaults to. It is its own workspace so that
+# `cargo build --all` (used to build the Linux stages) does not try to compile
+# it for the host/musl target.
+exclude = ["crates/stage0", "crates/stage0-test-payload"]
 resolver = "2"
 
 [workspace.package]

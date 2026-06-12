@@ -38,6 +38,7 @@ You can run any statically linked Linux ELF, but the minimal filesystem only has
 
 ## Components
 
+- **[stage0](crates/stage0/README.md)**: Kernel-less UEFI netboot loader (downloads + measures + chain-loads a UEFI payload)
 - **[stage1](crates/stage1/README.md)**: Secure bootloader (fetches config, verifies binaries, extends PCRs)
 - **[example-stage2](crates/example-stage2/README.md)**: Example user application
 - **[vaportpm](https://github.com/lockboot/vaportpm)**: TPM 2.0 attestation library (external dependency)
