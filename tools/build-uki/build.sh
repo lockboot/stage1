@@ -200,19 +200,37 @@ echo "Building UKI..."
 UKI_PATH="${OUTPUT_DIR}/linux.efi"
 
 # Create cmdline file with architecture-specific console settings
+# The kernel command line is embedded in the signed UKI, so the VM operator cannot change it.
+#
+# Security flags (threat model: VM operator is the adversary):
+#   hibernate=no              - Disable hibernation; prevents memory being written to operator-controlled EBS volume
+#   lockdown=confidentiality  - Kernel lockdown LSM; blocks /dev/mem, /proc/kcore, unsigned modules, unsigned kexec
+#   debugfs=off               - Disable debugfs entirely; lockdown restricts some access but this removes the surface
+#   oops=panic                - Halt on kernel oops; don't continue in a potentially exploitable state
+#   iommu.strict=1            - Strict IOMMU TLB invalidation on DMA unmap; prevents DMA-based attacks from virtual devices
+#   slab_nomerge              - Prevent slab cache merging; makes slab-based kernel exploits harder
+#   randomize_kstack_offset=on - Randomize kernel stack offset per syscall; makes stack-based exploits less reliable
+#   page_alloc.shuffle=1      - Randomize page allocator freelists; makes heap layout less predictable
+#   init_on_alloc=1           - Zero-fill memory on allocation; prevents info leaks from recycled memory
+#   init_on_free=1            - Zero-fill memory on free; makes use-after-free exploitation harder
+#   crashkernel=0             - Reserve no memory for kdump; prevents crash dumps even if NMI is sent via cloud API
+#   vsyscall=none             - (x86_64 only) Remove legacy vsyscall page; eliminates a fixed-address ROP gadget
+#
+# NOTE: SysRq is disabled via /proc/sys/kernel/sysrq in the init script, not here.
+# "sysrq=" is not a valid kernel cmdline parameter (the kernel ignores it).
 CMDLINE_PATH="${OUTPUT_DIR}/cmdline.txt"
+CMDLINE_COMMON="earlycon hibernate=no lockdown=confidentiality debugfs=off oops=panic crashkernel=0 iommu.strict=1 slab_nomerge randomize_kstack_offset=on page_alloc.shuffle=1 init_on_alloc=1 init_on_free=1 ro"
 if [ "${ARCH}" = "x86_64" ]; then
-    # earlycon: auto-detect via ACPI SPCR table for early boot output
     # console=ttyS0: EC2 PCI UART (only serial device, gets ttyS0)
     # console=ttyS1: QEMU q35 ISA serial (default COM1 is ttyS0 with no backend,
     #                explicit isa-serial device becomes ttyS1)
-    echo "earlycon console=ttyS0,115200n8 console=ttyS1,115200n8 ro" > "${CMDLINE_PATH}"
+    CMDLINE_SERIAL="console=ttyS0,115200n8 console=ttyS1,115200n8 vsyscall=none"
 else
-    # earlycon: auto-detect via SPCR (arm64 also auto-registers SPCR as regular console)
     # console=ttyAMA0: PL011 UART on QEMU virt
     # console=ttyS0: 16550 PCI UART on EC2 Graviton and QEMU (PCI serial)
-    echo "earlycon console=ttyAMA0,115200n8 console=ttyS0,115200n8 ro" > "${CMDLINE_PATH}"
+    CMDLINE_SERIAL="console=ttyAMA0,115200n8 console=ttyS0,115200n8"
 fi
+echo "${CMDLINE_SERIAL} ${CMDLINE_COMMON}" > "${CMDLINE_PATH}"
 
 UNAME_PATH="${OUTPUT_DIR}/uname.txt"
 echo "${KERNEL_VERSION}" > "${UNAME_PATH}"

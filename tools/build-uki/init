@@ -1,48 +1,171 @@
 #!/bin/busybox sh
-set -xe
+set -eu
 BB=/bin/busybox
+
+# Log to kernel ring buffer so timestamps match printk's clock
+kmsg() { echo "$*" > /dev/kmsg; }
+log()  { kmsg "<6>init: $*"; }
+warn() { kmsg "<4>init: $*"; }
+die()  { kmsg "<3>init: $*"; $BB poweroff -f; }
+
+# sysctl path value — write or die. Pass -f to skip missing files with a warning.
+sysctl() {
+	_opt=0; [ "${1:-}" = "-f" ] && { _opt=1; shift; }
+	_path="/proc/sys/$1"; _name=$(echo "$1" | $BB tr '/' '.')
+	if [ ! -f "$_path" ]; then
+		[ $_opt -eq 1 ] && { warn "sysctl: $_name skipped (not found)"; return 0; }
+		die "sysctl: $_name not found"
+	fi
+	if ! echo "$2" > "$_path" 2>/dev/null; then
+		die "sysctl: $_name=$2 failed"
+	fi
+	log "sysctl: $_name=$2"
+}
+
+# mod name — load or die. Pass -q to skip silently, -w to warn.
+mod() {
+	_mode=die
+	case "${1:-}" in -q) _mode=quiet; shift;; -w) _mode=warn; shift;; esac
+	if $BB modprobe "$1" 2>/dev/null; then
+		log "modprobe: $1"
+	elif [ "$_mode" = "quiet" ]; then
+		return 0
+	elif [ "$_mode" = "warn" ]; then
+		warn "modprobe: $1 not available"
+	else
+		die "modprobe: $1 failed"
+	fi
+}
+
+#####################################################################
 # Mount essential filesystems
+#
 $BB mount -t proc none /proc
 $BB mount -t sysfs none /sys
 $BB mount -t devtmpfs none /dev
 $BB mount -t tmpfs none /tmp
+log "Filesystems mounted"
 
 # Skip efivarfs - not needed after firmware stage
 # $BB modprobe efivarfs
 # $BB mount -t efivarfs none /sys/firmware/efi/efivars
 
-# Load hardware RNG modules
-$BB modprobe rng-core
-$BB modprobe intel-rng 2>/dev/null || true
-$BB modprobe amd-rng 2>/dev/null || true
+#####################################################################
+# Load kernel modules
+#
+mod rng-core
+mod -q intel-rng
+mod -q amd-rng
 
-$BB modprobe failover
-$BB modprobe net_failover
-$BB modprobe virtio_pci
-$BB modprobe virtio_net
-$BB modprobe gve 2>/dev/null || echo "[WARN] gve driver not available"
-$BB modprobe ena 2>/dev/null || true
-$BB modprobe vsock
-$BB modprobe vhost
-$BB modprobe vhost_vsock
-$BB modprobe nitro_enclaves
+mod failover
+mod net_failover
+mod virtio_pci
+mod virtio_net
+mod -w gve
+mod -q ena
+mod vsock
+mod vhost
+mod vhost_vsock
+mod nitro_enclaves
 
+#####################################################################
+# Lock down kernel before handing off to stage1/stage2.
+#
+# One-way toggles (irreversible, even by root):
+sysctl kernel/modules_disabled 1
+sysctl kernel/kexec_load_disabled 1
+sysctl kernel/unprivileged_bpf_disabled 1
+# SysRq: operator can send BREAK+key via serial console API to dump kernel state
+# (SysRq+l/m/p) or trigger panic (SysRq+c). lockdown does NOT block SysRq.
+# This is a sysctl, not a kernel cmdline param. /proc/sysrq-trigger still works
+# for root, but that's within stage2's existing privilege boundary.
+sysctl kernel/sysrq 0
+# Reversible but raises the bar:
+sysctl kernel/kptr_restrict 2
+sysctl kernel/perf_event_paranoid 3
+sysctl kernel/yama/ptrace_scope 3
+sysctl kernel/dmesg_restrict 1
+sysctl net/core/bpf_jit_harden 2
+# Fail closed: crash immediately on abnormal conditions rather than continuing
+# in a potentially exploitable state. crashkernel=0 + lockdown ensures no
+# memory dump is produced on panic.
+sysctl kernel/nmi_watchdog 0
+sysctl kernel/panic_on_oops 1
+sysctl kernel/softlockup_panic 1
+sysctl -f kernel/hung_task_panic 1
+# x86-only NMI sysctls (not present on aarch64):
+sysctl -f kernel/panic_on_io_nmi 1
+sysctl -f kernel/panic_on_unrecovered_nmi 1
+sysctl -f kernel/unknown_nmi_panic 1
+
+#####################################################################
+# Prudent protection: standard hardening that systemd would normally
+# apply via sysctl.d. Since we don't run systemd, stage2 users would
+# otherwise get an unhardened baseline.
+#
+# Core dumps:
+sysctl kernel/core_pattern /dev/null
+sysctl fs/suid_dumpable 0
+# Filesystem protections:
+sysctl fs/protected_hardlinks 1
+sysctl fs/protected_symlinks 1
+sysctl fs/protected_fifos 2
+sysctl fs/protected_regular 2
+# Address space:
+sysctl kernel/randomize_va_space 2
+# Attack surface reduction (stage2 can re-enable as root if needed):
+sysctl vm/unprivileged_userfaultfd 0
+sysctl kernel/io_uring_disabled 2
+sysctl user/max_user_namespaces 0
+sysctl dev/tty/ldisc_autoload 0
+sysctl dev/tty/legacy_tiocsti 0
+sysctl vm/mmap_min_addr 65536
+# Kernel instrumentation (no business running in production):
+sysctl kernel/ftrace_enabled 0
+sysctl kernel/stack_tracer_enabled 0
+# Network hardening:
+sysctl net/ipv4/conf/all/rp_filter 1
+sysctl net/ipv4/conf/default/rp_filter 1
+sysctl net/ipv4/conf/all/accept_redirects 0
+sysctl net/ipv4/conf/default/accept_redirects 0
+sysctl net/ipv6/conf/all/accept_redirects 0
+sysctl net/ipv6/conf/default/accept_redirects 0
+sysctl net/ipv4/conf/all/send_redirects 0
+sysctl net/ipv4/conf/default/send_redirects 0
+sysctl net/ipv4/conf/all/accept_source_route 0
+sysctl net/ipv4/conf/default/accept_source_route 0
+sysctl net/ipv6/conf/all/accept_source_route 0
+sysctl net/ipv6/conf/default/accept_source_route 0
+sysctl net/ipv4/tcp_syncookies 1
+sysctl net/ipv6/conf/all/accept_ra 0
+sysctl net/ipv6/conf/default/accept_ra 0
+sysctl net/core/default_qdisc fq_codel
+# Fedora sysctl.d defaults we inherit:
+sysctl kernel/pid_max 4194304
+
+#####################################################################
+# Setup networking
+#
 $BB ip link set lo up
 # Find first non-loopback interface
 ETH_IFACE=$($BB ip link show | $BB grep -v loopback | $BB grep -v 'lo:' | $BB head -1 | $BB awk '{print $2}' | $BB sed 's/://')
 if [ -n "$ETH_IFACE" ]; then
 	$BB ip link set "$ETH_IFACE" up
-	$BB udhcpc -i "$ETH_IFACE" -n -s /bin/udhcpc.script
+	$BB udhcpc -i "$ETH_IFACE" -n -s /bin/udhcpc.script 2>&1 | while IFS= read -r line; do kmsg "<6>$line"; done
+	# Pipeline swallows exit code (no pipefail in ash), so verify we got an IP
+	$BB ip addr show "$ETH_IFACE" | $BB grep -q 'inet ' || { die "DHCP failed on $ETH_IFACE"; }
 else
-	echo "[ERROR] No network interface found"
-    $BB poweroff -f
-    exit
+	die "No network interface found"
+	exit
 fi
 
+#####################################################################
+# Finally, exec stage1
+log "exec $($BB sha256sum /bin/stage1)"
 exec /bin/stage1
 
-# Shutdown
-echo "[ERROR] Failed to run stage1"
-$BB sleep 2
-$BB poweroff -f
+#####################################################################
+# Oops! FUBAR! Shutdown!
+#
+die "Failed to run stage1"
 exit

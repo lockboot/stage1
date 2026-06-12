@@ -24,7 +24,6 @@ FROM scratch
 
 # Copy the binaries from the builder stage
 COPY --from=builder /target/busybox /bin/busybox
-COPY --from=builder /target/bubblewrap /bin/bwrap
 COPY --from=builder /target/stage1 /bin/stage1
 
 # Set the entrypoint to busybox shell

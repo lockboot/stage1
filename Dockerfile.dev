@@ -21,7 +21,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -qq update && \
     dnsmasq \
     swtpm swtpm-tools \
     tpm2-tools xxd \
-    gh jq
+    gh jq python3-venv
 
 RUN groupadd -g 1000 vscode-dc && useradd -u 1000 -g 1000 -d /src -s /bin/bash vscode-dc
 
