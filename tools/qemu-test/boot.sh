@@ -7,21 +7,86 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Repository root (computed from script location: tools/qemu-test -> ../..)
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-if [ "$YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES" != 1 ]; then
+usage() {
+    cat <<'EOF'
+Usage: boot.sh [OPTIONS]
+
+Boot a lockboot disk image under QEMU with Secure Boot, an emulated TPM 2.0,
+and a mocked EC2 metadata service.
+
+Options:
+  --kind <uki|stage0>      What to boot (default: uki).
+                             uki    = Linux Unified Kernel Image (stage1 path)
+                             stage0 = pure-UEFI network bootloader
+  --arch <x86_64|aarch64>  Target architecture (default: $ARCH or x86_64).
+  --boot-disk <path>       Override the disk image to boot.
+  --user-data <path>       Override the metadata user-data JSON.
+  --ovmf-vars <path>       Override the OVMF/EFI variables file.
+  --payload <path>         (stage0) Serve this UEFI payload over HTTP at
+                           http://10.0.2.1:8000/payload.efi for stage0 to fetch.
+  --trace                  Capture the guest's TCP traffic on tap0 to a pcap at
+                           stage0-trace.pcap in the repo root (bind-mounted, so it
+                           persists on the host). Open in Wireshark / tshark to
+                           reassemble the HTTP streams.
+  -h, --help               Show this help and exit.
+
+Defaults by --kind:
+  uki    : disk tools/build-uki/<arch>/boot.disk,    user-data.json
+  stage0 : disk tools/build-stage0/<arch>/boot.disk, user-data.stage0.json
+
+The tap/iptables setup needs NET_ADMIN; run via 'make boot-...' (privileged
+dev container) or with sudo and YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1.
+EOF
+}
+
+# Defaults (ARCH may still come from the environment for Makefile compatibility)
+ARCH="${ARCH:-x86_64}"
+BOOT_KIND="uki"
+BOOT_DISK=""
+USER_DATA=""
+OVMF_VARS_OVERRIDE=""
+PAYLOAD=""
+TRACE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --kind)      BOOT_KIND="$2"; shift 2 ;;
+        --arch)      ARCH="$2"; shift 2 ;;
+        --boot-disk) BOOT_DISK="$2"; shift 2 ;;
+        --user-data) USER_DATA="$2"; shift 2 ;;
+        --ovmf-vars) OVMF_VARS_OVERRIDE="$2"; shift 2 ;;
+        --payload)   PAYLOAD="$2"; shift 2 ;;
+        --trace)     TRACE=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+if [ "${YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES:-}" != 1 ]; then
     echo "Error: not inside docker, refusing to do dangerous stuff!!"
+    echo "Run via 'make boot-...' or sudo with YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1."
     exit 1
 fi
 
-# Get architecture from environment (default to x86_64)
-ARCH=${ARCH:-x86_64}
+case "${ARCH}" in x86_64|aarch64) ;; *) echo "Unsupported ARCH: ${ARCH}"; exit 1 ;; esac
+case "${BOOT_KIND}" in uki|stage0) ;; *) echo "Unknown --kind: ${BOOT_KIND}"; exit 1 ;; esac
 
-# Default user-data file
 KEYDIR="${REPO_ROOT}/tools/build-uki/keys"
-USER_DATA="${REPO_ROOT}/user-data.json"
 TMP=/tmp
 
-echo "=== Booting UKI with Secure Boot + TPM 2.0 (${ARCH}) ==="
+# Resolve disk / user-data defaults from the selected kind (flags win).
+if [ "${BOOT_KIND}" = "stage0" ]; then
+    DISK_DIR="${REPO_ROOT}/tools/build-stage0/${ARCH}"
+    : "${USER_DATA:=${REPO_ROOT}/user-data.stage0.json}"
+else
+    DISK_DIR="${REPO_ROOT}/tools/build-uki/${ARCH}"
+    : "${USER_DATA:=${REPO_ROOT}/user-data.json}"
+fi
+: "${BOOT_DISK:=${DISK_DIR}/boot.disk}"
+
+echo "=== Booting ${BOOT_KIND} with Secure Boot + TPM 2.0 (${ARCH}) ==="
 echo "User-data file: ${USER_DATA}"
+echo "Boot disk:      ${BOOT_DISK}"
 
 AMMM=${SCRIPT_DIR}/ec2-metadata-mock-linux-amd64
 
@@ -36,10 +101,9 @@ if [ ! -f "${USER_DATA}" ]; then
     exit 1
 fi
 
-# Boot disk location (in tools/build-uki)
-BOOT_DISK="${REPO_ROOT}/tools/build-uki/${ARCH}/boot.disk"
+# Boot disk resolved above from --kind/--boot-disk.
 if [ ! -f "${BOOT_DISK}" ]; then
-    echo "Error: ${BOOT_DISK} not found. Run 'make ${ARCH}' first."
+    echo "Error: ${BOOT_DISK} not found. Build it first (see --help)."
     exit 1
 fi
 
@@ -77,7 +141,7 @@ else
     exit 1
 fi
 
-OVMF_VARS_ORIG="${REPO_ROOT}/tools/build-uki/${ARCH}/efi-vars.ovmf"
+OVMF_VARS_ORIG="${OVMF_VARS_OVERRIDE:-${DISK_DIR}/efi-vars.ovmf}"
 OVMF_VARS="/tmp/efi-vars.ovmf"
 
 if [ ! -f "${OVMF_CODE}" ]; then
@@ -106,6 +170,12 @@ sleep 1
 cleanup() {
     kill $(cat $TMP/swtpm.pid 2>/dev/null) 2>/dev/null || true
     kill $(cat $TMP/ec2-mock.pid 2>/dev/null) 2>/dev/null || true
+    kill $(cat $TMP/payload-http.pid 2>/dev/null) 2>/dev/null || true
+    kill $(cat $TMP/tcpdump.pid 2>/dev/null) 2>/dev/null || true
+    # The boot runs as root; hand the trace back to the host user.
+    if [ "${TRACE}" = 1 ] && [ -n "${OWNER_UID:-}" ] && [ -f "${TRACE_FILE:-}" ]; then
+        chown "${OWNER_UID}:${OWNER_GID:-${OWNER_UID}}" "${TRACE_FILE}" 2>/dev/null || true
+    fi
 }
 
 # Set trap to cleanup on exit
@@ -121,6 +191,17 @@ ip link set tap0 up
 ip addr add 10.0.2.1/24 dev tap0
 ip addr add 169.254.169.254/24 dev tap0
 
+# Optional: capture the guest's full TCP traffic to a pcap (full packets, so the
+# HTTP streams can be reassembled/extracted in Wireshark/tshark). Written into
+# the bind-mounted repo so it survives the container.
+TRACE_FILE="${REPO_ROOT}/stage0-trace.pcap"
+if [ "${TRACE}" = 1 ]; then
+    echo "Capturing tap0 TCP -> ${TRACE_FILE} (repo root; open in Wireshark)"
+    tcpdump -i tap0 -s 0 -U -w "${TRACE_FILE}" tcp 2>/dev/null &
+    echo $! > $TMP/tcpdump.pid
+    sleep 0.5
+fi
+
 # Create AEMM config with user-data
 echo "Starting EC2 metadata mock..."
 echo '{"userdata":{"values":{"userdata":"'$(base64 -w0 "${USER_DATA}")'"}}}' > $TMP/aemm-config.json
@@ -135,6 +216,26 @@ echo $! > $TMP/ec2-mock.pid
 
 # Give services time to start
 sleep 1
+
+# Optionally serve the stage0 payload over HTTP on the tap gateway, so a
+# `_stage0` user-data can point at http://10.0.2.1:8000/payload.efi.
+if [ -n "${PAYLOAD}" ]; then
+    if [ ! -f "${PAYLOAD}" ]; then
+        echo "Error: payload ${PAYLOAD} not found"; exit 1
+    fi
+    PAYLOAD_DIR=$(mktemp -d)
+    cp "${PAYLOAD}" "${PAYLOAD_DIR}/payload.efi"
+    # In signed mode stage0 also fetches a detached signature at <url>.sig;
+    # serve it alongside the payload if the build produced one.
+    [ -f "${PAYLOAD}.sig" ] && cp "${PAYLOAD}.sig" "${PAYLOAD_DIR}/payload.efi.sig"
+    # Serve over HTTP/1.1 (with Content-Length + keep-alive). The default
+    # `python -m http.server` speaks HTTP/1.0 with `Connection: close`, which
+    # OVMF's HttpDxe does not complete the response token for. Real cloud object
+    # stores (S3/GCS) serve HTTP/1.1, so this matches production.
+    ( cd "${PAYLOAD_DIR}" && exec python3 -c 'import http.server; http.server.SimpleHTTPRequestHandler.protocol_version="HTTP/1.1"; http.server.ThreadingHTTPServer(("10.0.2.1",8000), http.server.SimpleHTTPRequestHandler).serve_forever()' ) &
+    echo $! > $TMP/payload-http.pid
+    echo "Serving payload (HTTP/1.1) at http://10.0.2.1:8000/payload.efi (sha256 $(sha256sum "${PAYLOAD}" | cut -d' ' -f1))"
+fi
 
 echo 1 > /proc/sys/net/ipv4/ip_forward
 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
@@ -153,6 +254,7 @@ cat > /tmp/dnsmasq-hosts <<EOF
 10.0.2.18 ip-10-0-2-18
 10.0.2.19 ip-10-0-2-19
 10.0.2.20 ip-10-0-2-20
+10.0.2.1 payload.lockboot.test
 EOF
 
 # Start DHCP with EC2-like configuration

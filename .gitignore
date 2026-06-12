@@ -30,5 +30,10 @@ __pycache__
 old
 .docker
 user-data.json
+user-data.stage0.json
+# Ignore stage0 build outputs (x86_64/, aarch64/) and the release key (keys/),
+# but keep tools/build-stage0/build.sh tracked.
+tools/build-stage0/*/
 .bashrc
 .lesshst
+stage0-trace.*
