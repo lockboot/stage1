@@ -11,9 +11,9 @@ COPY tools/build-uki/aarch64/ /binaries/aarch64/
 # Create arch-specific directory based on TARGETARCH
 RUN mkdir -p /target && \
     if [ "$TARGETARCH" = "amd64" ]; then \
-        cp /binaries/x86_64/busybox /binaries/x86_64/bubblewrap /binaries/x86_64/stage1 /target/; \
+        cp /binaries/x86_64/busybox /binaries/x86_64/stage1 /target/; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
-        cp /binaries/aarch64/busybox /binaries/aarch64/bubblewrap /binaries/aarch64/stage1 /target/; \
+        cp /binaries/aarch64/busybox /binaries/aarch64/stage1 /target/; \
     else \
         echo "Unsupported architecture: $TARGETARCH" && exit 1; \
     fi

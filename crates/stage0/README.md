@@ -1,112 +1,107 @@
-# stage0 — measured UEFI network bootloader
+# stage0 - measured UEFI network bootloader
 
-`stage0` is a pure-UEFI application (no Linux kernel) that the firmware boots
-directly. It downloads and chain-loads another **UEFI** binary over the network,
-measuring it into the TPM first. It is the kernel-less sibling of `stage1`:
-same metadata-driven, measure-then-execute model, but living entirely in UEFI
-boot services.
+A kernel-less UEFI application the firmware boots directly. It fetches a
+`_stage1` document from the cloud metadata service, downloads the UEFI payload it
+names, admits it (pinned hash or signature), measures it into the TPM, and
+chain-loads it - native UEFI sibling of `stage1`.
 
-## Flow
+## Using it
 
-1. Bring up the NIC via `EFI_IP4_CONFIG2` (DHCP).
-2. Fetch a `_stage0` user-data document from the cloud metadata service over
-   `EFI_HTTP_PROTOCOL` (EC2 IMDSv2 → GCP → Azure → Aliyun, mirroring `stage1`).
-3. Download the per-arch UEFI payload from the pinned URL over raw `EFI_TCP4`
-   (`src/tcp4.rs`); a hostname URL is resolved via `EFI_DNS4` (`src/dns4.rs`).
-   Metadata uses `EFI_HTTP` at fixed link-local IPs; the payload uses TCP4.
-4. **Admit** the payload by one of two policies (see "Admission & trust"):
-   - **sha256 mode** — the payload's SHA-256 must equal the value pinned in the
-     metadata (immutable payload).
-   - **signed mode** — a detached ed25519 signature fetched from `<url>.sig` must
-     verify against a long-term release **public key** pinned in the metadata
-     (the payload can roll forward without editing metadata).
-5. Measure into the TPM via `EFI_TCG2_PROTOCOL`: **PCR 14** ← SHA-256(payload).
-   Nothing else is measured — see "Admission & trust".
-6. `LoadImage` (from the memory buffer, via a temporary `FileAuthentication`
-   override) + `StartImage` to chain-load.
-
-Integrity/authenticity comes from the pinned hash or signature, so plain HTTP is
-used (no reliance on the inconsistently-available `EFI_TLS_PROTOCOL`).
-
-## Admission & trust
-
-The attestation surface is deliberately minimal: **the only thing measured is
-PCR 14** — "stage0 ran, and it loaded a binary with this hash." The config, the
-pinned hash, the release key and the signature are *not* measured. A verifier
-just checks PCR 14 against the set of approved release hashes; it does not have
-to model the metadata document or key material. (This is why PCR 15 — the config
-measurement `stage1` does — is intentionally dropped here.)
-
-The signature/hash is **admission control only**: it decides whether stage0 is
-*willing* to load a payload, not what gets attested. Signed mode exists so a
-deployment can pin a long-term release key once and let new builds roll forward
-under that key without touching VM metadata; the private key stays offline with
-the publisher and never reaches a deployed machine.
-
-Because the payload is admitted by stage0's own policy rather than the firmware
-`db`, stage0 chain-loads it through a temporary **security-arch override**
-(`secauth.rs`): it swaps `EFI_SECURITY2_ARCH_PROTOCOL.FileAuthentication` for an
-allow-all across a single `LoadImage`, then restores it — exactly shim's
-`security_policy_install()`. The firmware still does all real PE loading and
-relocation; only the *verdict* is replaced. This is what lets the deployment
-keep its lockdown model (a per-release, ephemeral `db` key that signs `stage0`
-itself and is then destroyed, with the variable store locked) **and** still
-chain-load late-bound payloads — the two are otherwise mutually exclusive, since
-an ephemeral, destroyed key cannot sign a payload fetched at boot.
-
-Note this makes `stage0` a trust anchor *with policy*, not merely a measurer:
-it is itself `db`-signed and measured, and everything it loads is measured into
-PCR 14, so the chain stays attestable end to end.
-
-## `_stage0` metadata schema
-
-Each arch entry carries a `url` plus **exactly one** of `sha256` (pin an exact
-hash) or `ed25519` (pin a base64 release public key; the detached signature is
-fetched from `<url>.sig`):
+stage0 ships as a `db`-signed boot disk; use it as your VM's boot volume. Point
+it at your payload with a `_stage1` user-data document:
 
 ```json
 {
-  "_stage0": {
-    "args": ["optional", "load-options"],
-    "x86_64":  { "url": "http://…/payload.efi", "sha256":  "<64 hex>" },
-    "aarch64": { "url": "http://…/payload.efi", "ed25519": "<base64 32-byte pubkey>" }
-  }
+   "_stage1": {
+      "x86_64": {
+         "url": "http://cdn.example.com/app.efi",
+         "sha256": "<64-hex sha256>"
+      },
+      "aarch64": {
+         "url": "http://cdn.example.com/app.efi",
+         "ed25519": "<base64 pubkey>",
+         "args_url": "http://cdn.example.com/app.args",  // optional
+      }
+   }
 }
 ```
 
-## TPM access
+Per arch, pick the admission mode:
 
-`stage0` reuses `vaportpm-attest` unchanged — that crate funnels all TPM I/O
-through its `TpmTransport` trait, so `stage0` supplies a `Tcg2Transport` backed
-by `EFI_TCG2_PROTOCOL.SubmitCommand` (`src/tcg2.rs`) and calls the same
-`pcr_extend` used on Linux. `stage0` only *measures*; the chained payload (or a
-later Linux stage) produces the actual TPM2_Quote. Build the crate with
-`--no-default-features` (no_std) for UEFI targets.
+- **`sha256`**: pin an exact hash. Immutable; re-pin for every build.
+- **`ed25519`**: pin a long-term release public key. The payload rolls forward
+  without editing metadata: sign each build offline and serve the detached
+  signature at `<url>.sig`, or at a `sig_url` of your choice. A `{sha256}` in
+  `sig_url` is replaced with the payload's hash, so signatures can be
+  content-addressed (e.g. `http://cdn.example.com/sigs/{sha256}.sig`).
 
-## Build & test
+The payload must be a UEFI PE. However the firmware `db` feels about it, stage0
+admits it by your pin/signature and measures it into **PCR 14** (= its SHA-256).
 
-```sh
-# Build the stage0 .efi (in the build container; vaportpm pulled from git)
-make tools/build-stage0/x86_64/stage0.efi          # or aarch64
+### Embedded metadata (self-contained `netboot.efi`)
 
-# Assemble + sign the bootable ESP disk (privileged: losetup/mount)
-make tools/build-stage0/x86_64/boot.disk
+The `_stage1` document can be embedded in stage0's PE before Authenticode
+signing. If a `.stage0` section is present, stage0 reads the document from that
+section and does not contact the metadata service. The metadata is either embedded
+or fetched, never both.
 
-# End-to-end under QEMU: builds + ed25519-signs the test payload, pins the
-# release pubkey into user-data.stage0.json (signed mode), serves the payload
-# and its .sig locally (via a DNS name, exercising EFI_DNS4), and boots stage0.
-make test-stage0-x86_64
+The section holds the complete user-data JSON: the same `{ "_stage1": { ... } }`
+document the metadata service would return, not just the inner object. It is part
+of the signed, firmware-measured image, so the key, URL and args it pins are fixed
+at signing time. The result is a single file that runs one fixed configuration,
+with the payload still gated by your release key.
 
-# Or boot an already-built disk, choosing what to boot:
-./tools/qemu-test/boot.sh --kind stage0 --arch x86_64 \
-    --payload tools/build-stage0/x86_64/payload.efi
-./tools/qemu-test/boot.sh --help
-```
+Embed the document, then sign:
 
-Always include the arch suffix: `make boot-stage0` (no arch) is **not** a target
-— it would be misread as a UKI build for an architecture literally named
-"stage0".
+    objcopy --add-section .stage0=user-data.json \
+            --set-section-flags .stage0=alloc,load,readonly,data \
+            stage0.efi netboot.efi
+    sbsign --key db.key --cert db.crt --output netboot.efi netboot.efi
 
-The test payload (`crates/stage0-test-payload`) is a trivial chain-loaded UEFI
-app that prints a banner and reads back PCR 14/15, confirming the
-measure-then-execute path end to end.
+The section must be loaded: mapped at its virtual address, with `SizeOfImage`
+covering it. If it is not, stage0 ignores it and falls back to the metadata
+service.
+
+## What it does
+
+On boot, in order:
+
+1. Brings the NIC up via DHCP (`EFI_IP4_CONFIG2`).
+2. Fetches `_stage1` user-data from the metadata service, trying
+   EC2 IMDSv2, GCP, Azure & Aliyun at their fixed IPs.
+3. Downloads the per-arch payload from `url` (hostnames resolved via `EFI_DNS4`).
+   All networking is raw `EFI_TCP4`, no `EFI_HTTP` or TLS; integrity comes from
+   the pin/signature, not the transport.
+4. **Admits** it: its SHA-256 must equal the pinned `sha256`, or a detached
+   ed25519 signature (`<url>.sig`) must verify against the pinned `ed25519` key.
+5. **Measures** it: `PCR 14 ← SHA-256(payload)` via `EFI_TCG2_PROTOCOL`. Nothing
+   else is measured; attestation is simply "stage0 ran and loaded this hash"
+   (no config, key, or PCR 15).
+6. **Chain-loads** it (`LoadImage` from memory + `StartImage`), bypassing the
+   firmware `db` check with a temporary `FileAuthentication` override so
+   late-bound payloads need no `db` signature.
+
+stage0 is itself `db`-signed and measured, so the chain stays attestable; the
+pin/signature is admission control only and is never attested.
+
+## `_stage1` metadata reference
+
+A `_stage1` object with an optional `args` and one entry per architecture. Each
+arch entry needs `url` **and exactly one** of `sha256` or `ed25519`.
+
+| Field | In | Type | Rules |
+|---|---|---|---|
+| `args` | `_stage1` | `string[]` | optional; passed to the payload as UEFI load options |
+| `x86_64` / `aarch64` | `_stage1` | object | per-arch entry; the running arch's must be present |
+| `url` | arch entry | `string` | `http://…`, printable ASCII (TLS is not used) |
+| `sha256` | arch entry | `string` | exactly 64 hex characters |
+| `ed25519` | arch entry | `string` | base64 of a 32-byte public key |
+| `sig_url` | arch entry | `string` | optional (signed mode); payload signature location, `{sha256}` → payload hash. Defaults to `<url>.sig` |
+| `args_url` | arch entry | `string` | optional (signed mode only); fetch signed load options here, `{sha256}` → payload hash. Overrides inline `args` |
+| `args_sig_url` | arch entry | `string` | optional; signature for `args_url`, `{sha256}` → payload hash. Defaults to `<args_url>.sig`. Requires `args_url` |
+
+`args_url` content is verified against `ed25519` (the same release key as the
+payload) and used verbatim, trimmed, as the load-options string.
+
+The document is shared with `stage1`'s `_stage2`; the distinct `_stage1` key
+keeps a UEFI payload from being confused with a Linux one.

@@ -4,15 +4,17 @@
 //!
 //! Mirrors `stage1`'s provider order and endpoints (EC2 IMDSv2 → GCP → Azure),
 //! plus a best-effort Aliyun path, using fixed link-local IPs so no DNS is
-//! needed to reach the metadata service itself.
+//! needed to reach the metadata service itself. Requests go over the raw-TCP4
+//! HTTP client ([`crate::http`]); the network must be brought up first.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
-use crate::http::{is_ok, HttpClient, HttpMethod};
-use uefi::{println, Status};
+use crate::http::{self, is_ok, HttpMethod};
+use uefi::Status;
 
 const EC2_TOKEN_URL: &str = "http://169.254.169.254/latest/api/token";
 const EC2_USERDATA_URL: &str = "http://169.254.169.254/latest/user-data";
@@ -23,10 +25,10 @@ const AZURE_USERDATA_URL: &str =
 const ALIYUN_USERDATA_URL: &str = "http://100.100.100.200/latest/user-data";
 
 /// A metadata provider: name + a fetch function returning the raw user-data.
-type Provider = fn(&mut HttpClient) -> Result<Vec<u8>, Status>;
+type Provider = fn() -> Result<Vec<u8>, Status>;
 
 /// Try each cloud provider in turn; return the first user-data document found.
-pub fn fetch(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
+pub fn fetch() -> Result<Vec<u8>, Status> {
     let providers: [(&str, Provider); 4] = [
         ("EC2 (IMDSv2)", try_ec2),
         ("GCP", try_gcp),
@@ -34,23 +36,24 @@ pub fn fetch(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
         ("Aliyun", try_aliyun),
     ];
     for (name, try_fn) in providers {
-        println!("stage0: trying metadata provider: {name}");
-        match try_fn(client) {
+        crate::sdbg!("stage0:   trying metadata provider: {name}");
+        match try_fn() {
             Ok(data) => {
-                println!("stage0:   {name} returned {} bytes", data.len());
+                let h = hex::encode(Sha256::digest(&data));
+                crate::slog!("stage0: metadata: {name} {} bytes sha256:{h}", data.len());
                 return Ok(data);
             }
-            Err(e) => println!("stage0:   {name} failed: {:?}", e),
+            Err(e) => crate::sdbg!("stage0:   {name} failed: {:?}", e),
         }
     }
-    println!("stage0: no metadata provider responded");
+    crate::slog!("stage0: no metadata provider responded");
     Err(Status::NOT_FOUND)
 }
 
 /// AWS EC2 IMDSv2: obtain a session token (PUT), then GET user-data.
-fn try_ec2(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
-    let (status, token) = client.fetch(
-        HttpMethod::PUT,
+fn try_ec2() -> Result<Vec<u8>, Status> {
+    let (status, token) = http::fetch(
+        HttpMethod::Put,
         EC2_TOKEN_URL,
         &[("X-aws-ec2-metadata-token-ttl-seconds", "21600")],
     )?;
@@ -60,8 +63,8 @@ fn try_ec2(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
     let token = String::from_utf8(token).map_err(|_| Status::ABORTED)?;
     let token = token.trim();
 
-    let (status, body) = client.fetch(
-        HttpMethod::GET,
+    let (status, body) = http::fetch(
+        HttpMethod::Get,
         EC2_USERDATA_URL,
         &[("X-aws-ec2-metadata-token", token)],
     )?;
@@ -72,9 +75,9 @@ fn try_ec2(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
 }
 
 /// GCP compute metadata (reachable at the link-local IP; requires the flavor header).
-fn try_gcp(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
-    let (status, body) = client.fetch(
-        HttpMethod::GET,
+fn try_gcp() -> Result<Vec<u8>, Status> {
+    let (status, body) = http::fetch(
+        HttpMethod::Get,
         GCP_USERDATA_URL,
         &[
             ("Metadata-Flavor", "Google"),
@@ -88,9 +91,8 @@ fn try_gcp(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
 }
 
 /// Azure IMDS: user-data is returned base64-encoded.
-fn try_azure(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
-    let (status, body) =
-        client.fetch(HttpMethod::GET, AZURE_USERDATA_URL, &[("Metadata", "true")])?;
+fn try_azure() -> Result<Vec<u8>, Status> {
+    let (status, body) = http::fetch(HttpMethod::Get, AZURE_USERDATA_URL, &[("Metadata", "true")])?;
     if !is_ok(status) {
         return Err(Status::ABORTED);
     }
@@ -99,8 +101,8 @@ fn try_azure(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
 }
 
 /// Aliyun ECS metadata (best-effort; v1 plain GET of user-data).
-fn try_aliyun(client: &mut HttpClient) -> Result<Vec<u8>, Status> {
-    let (status, body) = client.fetch(HttpMethod::GET, ALIYUN_USERDATA_URL, &[])?;
+fn try_aliyun() -> Result<Vec<u8>, Status> {
+    let (status, body) = http::fetch(HttpMethod::Get, ALIYUN_USERDATA_URL, &[])?;
     if !is_ok(status) {
         return Err(Status::ABORTED);
     }

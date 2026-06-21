@@ -3,7 +3,10 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    # Two independent release tracks, gated by tag prefix:
+    #   stage0-v*  → the Secure Boot root of trust (db-signed, baked into the AMI)
+    #   uki-v*     → the netboot UKI (stage1), admitted by stage0 via sha256 + PCR 14
+    tags: ['stage0-v*', 'uki-v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -19,33 +22,130 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Build UKI for ${{ matrix.arch }}
-        run: make ${{ matrix.arch }}
+      # Build BOTH artifacts (ephemeral snakeoil keys) for every push/PR/tag so the
+      # whole chain is validated on each change. One `make` invocation builds the
+      # docker build-image once and produces:
+      #   tools/build-uki/<arch>/linux.efi (+ .sha256, snippet, os-release, busybox, stage1)
+      #   tools/build-stage0/<arch>/{boot.disk, BOOT*.EFI, efi-vars.*, *.cer, *.guid}
+      - name: Build UKI + stage0 for ${{ matrix.arch }}
+        run: make ${{ matrix.arch }} stage0-${{ matrix.arch }}
 
-      - name: Copy public keys to arch directory
-        run: |
-          cp tools/build-uki/keys/*.cer tools/build-uki/${{ matrix.arch }}/
-          cp tools/build-uki/keys/*.guid tools/build-uki/${{ matrix.arch }}/
-
+      # UKI (stage1) track: the netboot payload + its sha256 pin + the _stage1
+      # snippet, plus busybox/stage1 for the stage1 runtime image.
       - name: Upload UKI artifacts for ${{ matrix.arch }}
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
-          name: ${{ matrix.arch }}
+          name: uki-${{ matrix.arch }}
           path: |
-            tools/build-uki/${{ matrix.arch }}/boot.disk
+            tools/build-uki/${{ matrix.arch }}/linux.efi
+            tools/build-uki/${{ matrix.arch }}/linux.efi.sha256
+            tools/build-uki/${{ matrix.arch }}/stage0-snippet.json
+            tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/busybox
             tools/build-uki/${{ matrix.arch }}/stage1
-            tools/build-uki/${{ matrix.arch }}/os-release
-            tools/build-uki/${{ matrix.arch }}/efi-vars.*
-            tools/build-uki/${{ matrix.arch }}/*.cer
-            tools/build-uki/${{ matrix.arch }}/*.guid
-  
+
+      # stage0 track: the firmware-admitted root + the public Secure Boot material
+      # (efi-vars for enrollment, *.cer/*.guid) needed to deploy a cloud image.
+      - name: Upload stage0 artifacts for ${{ matrix.arch }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: stage0-${{ matrix.arch }}
+          path: |
+            tools/build-stage0/${{ matrix.arch }}/boot.disk
+            tools/build-stage0/${{ matrix.arch }}/BOOT*.EFI
+            tools/build-stage0/${{ matrix.arch }}/efi-vars.*
+            tools/build-stage0/${{ matrix.arch }}/os-release
+            tools/build-stage0/${{ matrix.arch }}/*.cer
+            tools/build-stage0/${{ matrix.arch }}/*.guid
+
+  # ---- stage0 release track (tag: stage0-v*) -------------------------------
+  release-stage0:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/stage0-v')
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download stage0 artifact zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
+          for arch in x86_64 aarch64; do
+            ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name==\"stage0-$arch\") | .id")
+            gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > stage0-${arch}.zip
+          done
+
+      - name: Attest stage0 zips
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            stage0-x86_64.zip
+            stage0-aarch64.zip
+
+      - name: Create stage0 release
+        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            stage0-x86_64.zip
+            stage0-aarch64.zip
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          make_latest: true
+
+  # ---- UKI (stage1) release track (tag: uki-v*) ----------------------------
+  release-uki:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/uki-v')
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download UKI artifact zips
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
+          for arch in x86_64 aarch64; do
+            ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name==\"uki-$arch\") | .id")
+            gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > uki-${arch}.zip
+          done
+
+      - name: Attest UKI zips
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            uki-x86_64.zip
+            uki-aarch64.zip
+
+      - name: Create UKI release
+        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            uki-x86_64.zip
+            uki-aarch64.zip
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          make_latest: true
+
+  # ---- stage1 runtime container image (tag: uki-v*) ------------------------
+  # Minimal busybox + stage1 utility image; belongs to the stage1/UKI track.
   release-docker:
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/uki-v')
     permissions:
-      contents: write
+      contents: read
       packages: write
       id-token: write
       attestations: write
@@ -54,16 +154,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Download x86_64 artifacts
+      - name: Download x86_64 UKI artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: x86_64
+          name: uki-x86_64
           path: tools/build-uki/x86_64
 
-      - name: Download aarch64 artifacts
+      - name: Download aarch64 UKI artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: aarch64
+          name: uki-aarch64
           path: tools/build-uki/aarch64
 
       - name: Set up Docker Buildx
@@ -106,59 +206,3 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-
-  release-zip:
-    runs-on: ubuntu-latest
-    needs: build
-    # Only run if build succeeded and it was triggered by a tag
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-
-      - name: Download artifact zips directly via API
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
-          for arch in x86_64 aarch64; do
-            ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name==\"$arch\") | .id")
-            gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > ${arch}.zip
-          done
-
-      - name: Attest x86_64 zip
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: 'x86_64.zip'
-
-      - name: Attest aarch64 zip
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: 'aarch64.zip'
-
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=tag
-          flavor: |
-            latest=auto
-
-      - name: Create Release
-        uses: softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
-        with:
-          tag_name: ${{ steps.meta.outputs.version }}
-          files: |
-            x86_64.zip
-            aarch64.zip
-          draft: false
-          prerelease: true
-          generate_release_notes: true
-          make_latest: true

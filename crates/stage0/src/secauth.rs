@@ -3,22 +3,22 @@
 //! Loading a payload that the UEFI `db` did not sign.
 //!
 //! Under Secure Boot, DXE core's `LoadImage` does not decide accept/reject
-//! itself — it delegates to the architectural security protocols. For a
+//! itself; it delegates to the architectural security protocols. For a
 //! memory-buffer load the authoritative gate is
 //! `EFI_SECURITY2_ARCH_PROTOCOL.FileAuthentication`, whose default
 //! implementation runs the `db`/`dbx` check and returns `ACCESS_DENIED` for an
 //! unsigned image. Older firmware without Security2 falls back to
 //! `EFI_SECURITY_ARCH_PROTOCOL.FileAuthenticationState`.
 //!
-//! These are plain function pointers in boot-services memory. stage0 — already
-//! a `db`-signed, measured image — temporarily swaps in an allow-all decision
+//! These are plain function pointers in boot-services memory. stage0, already
+//! a `db`-signed, measured image, temporarily swaps in an allow-all decision
 //! around a single `LoadImage`, then restores it. This is exactly shim's
 //! `security_policy_install()`/`uninstall()`: the firmware still does all the
 //! real PE loading, relocation and handle setup; only the *verdict* is replaced.
 //!
 //! stage0 has already verified the buffer (ed25519 signature against the pinned
 //! release key, or pinned SHA-256) before we get here, so the trust does not
-//! weaken — it moves from the firmware `db` (which is not remotely attestable
+//! weaken; it moves from the firmware `db` (which is not remotely attestable
 //! and, under our ephemeral-key lockdown, cannot sign late-bound payloads) into
 //! stage0's own policy. The payload is still measured into PCR 14, so the
 //! attestation chain is unbroken: stage0 ran, and it loaded *this* hash.
@@ -96,7 +96,7 @@ struct AuthOverride {
 
 impl AuthOverride {
     fn install() -> Self {
-        // EFI_SECURITY2_ARCH_PROTOCOL — authoritative for buffer loads on all
+        // EFI_SECURITY2_ARCH_PROTOCOL: authoritative for buffer loads on all
         // modern edk2/OVMF firmware (our targets).
         let security2 = open::<Security2>().map(|mut sp| {
             let iface: *mut Security2Interface = &mut sp.0;
@@ -105,7 +105,7 @@ impl AuthOverride {
             (sp, saved)
         });
 
-        // EFI_SECURITY_ARCH_PROTOCOL — only consulted when Security2 is absent,
+        // EFI_SECURITY_ARCH_PROTOCOL: only consulted when Security2 is absent,
         // but override it too so we behave on older firmware.
         let security = open::<Security>().map(|mut sp| {
             let iface: *mut SecurityInterface = &mut sp.0;
@@ -153,7 +153,7 @@ fn open<P: uefi::proto::ProtocolPointer + 'static>() -> Option<ScopedProtocol<P>
 
 /// `LoadImage` a payload from memory, bypassing the Secure Boot `db` check via a
 /// temporary security-arch override. The caller MUST have already verified the
-/// buffer (signature or pinned hash) — this only relaxes the firmware gate.
+/// buffer (signature or pinned hash); this only relaxes the firmware gate.
 pub fn load_image_verified(buffer: &[u8]) -> Result<Handle, Status> {
     let _guard = AuthOverride::install();
     boot::load_image(

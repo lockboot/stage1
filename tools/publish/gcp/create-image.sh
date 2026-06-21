@@ -59,22 +59,24 @@ if [ "${VERSION}" != "local" ]; then
     fi
 
     echo "Repository: ${GH_REPO}"
-    echo "Downloading ${ARCH}.zip from release ${VERSION}..."
+    echo "Downloading stage0-${ARCH}.zip from release ${VERSION}..."
 
-    # Download the zip file
+    # The image boots stage0 (the firmware-admitted root of trust), so it is built
+    # from the stage0 release artifacts (boot.disk + Secure Boot certs). Use a
+    # stage0-v* release tag here.
     gh release download "${VERSION}" \
         --repo "${GH_REPO}" \
-        --pattern "${ARCH}.zip" \
+        --pattern "stage0-${ARCH}.zip" \
         --dir "${TEMP_DIR}"
 
     echo "Verifying attestation..."
     # Verify the attestation using gh
-    gh attestation verify "${TEMP_DIR}/${ARCH}.zip" \
+    gh attestation verify "${TEMP_DIR}/stage0-${ARCH}.zip" \
         --repo "${GH_REPO}" \
         || { echo "Error: Attestation verification failed"; exit 1; }
 
     echo "Extracting files..."
-    unzip -q "${TEMP_DIR}/${ARCH}.zip" -d "${TEMP_DIR}"
+    unzip -q "${TEMP_DIR}/stage0-${ARCH}.zip" -d "${TEMP_DIR}"
 
     # Use extracted files
     WORK_DIR="${TEMP_DIR}"
@@ -84,7 +86,7 @@ else
     # Get script directory and compute repo root
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-    WORK_DIR="${REPO_ROOT}/tools/build-uki/${ARCH}"
+    WORK_DIR="${REPO_ROOT}/tools/build-stage0/${ARCH}"
 fi
 
 IMAGE_FILE="${WORK_DIR}/boot.disk"

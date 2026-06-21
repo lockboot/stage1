@@ -107,6 +107,26 @@ else
     echo "Warning: ${OVMF_VARS_ORIG} not found; skipping EFI vars generation."
 fi
 
+# Emit os-release so the cloud publishers can name/tag the image (mirrors
+# build-uki). BUILD_ID is derived from the signed stage0 hash so each build is
+# traceable and distinct from UKI AMIs.
+OSREL_PATH="${OUTPUT_DIR}/os-release"
+YEAR_MONTH=$(date +%y.%m)
+{
+  echo "ID=lockboot"
+  echo "VERSION_ID=${YEAR_MONTH}"
+  echo "NAME=\"Lock.Boot stage0\""
+  echo "PRETTY_NAME=\"Lock.Boot stage0 ${YEAR_MONTH} ${ARCH}\""
+  echo "BUILD_ID=stage0-${EFI_HASH:0:12}"
+} > "${OSREL_PATH}"
+
+# Copy the public Secure Boot enrollment material next to boot.disk + efi-vars so
+# the GCP publisher (and manual enrollment) gets the certs in one release bundle.
+# The private *.crt.key is intentionally NOT copied (ephemeral, stays in keys/).
+for f in db.cer db.guid PK.cer PK.guid KEK.cer KEK.guid; do
+    [ -f "${KEYDIR}/${f}" ] && cp "${KEYDIR}/${f}" "${OUTPUT_DIR}/"
+done
+
 if [ -n "${OWNER_UID:-}" ] && [ -n "${OWNER_GID:-}" ]; then
     chown -R "${OWNER_UID}:${OWNER_GID}" "${OUTPUT_DIR}"
 fi

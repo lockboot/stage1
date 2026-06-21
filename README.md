@@ -13,7 +13,7 @@ A secure two-stage boot system using the TPM (and AWS Nitro, if available) for v
 The `make` based build system will create a bootable disk image to be run by Qemu (with a vTPM) to simulate a generic 'secure cloud' environment:
 
 ```bash
-make boot-x86_64 boot-aarch64
+make boot-stage0-x86_64
 ```
 
 ## Configuration Format

@@ -6,7 +6,7 @@
 //! [`TpmTransport`] trait. Here we provide a transport that ships those blocks
 //! over the firmware's `EFI_TCG2_PROTOCOL.SubmitCommand`, so the exact same
 //! `pcr_extend` logic that `stage1` runs against `/dev/tpmrm0` on Linux runs
-//! unchanged here — keeping a single measurement (and verification) model.
+//! unchanged here, keeping a single measurement (and verification) model.
 
 use alloc::boxed::Box;
 use alloc::vec;

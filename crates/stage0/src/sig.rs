@@ -8,7 +8,7 @@
 //! (`<url>.sig`, 64 raw bytes) and verifies it against the pinned key before
 //! loading. This lets a release roll forward without editing VM metadata.
 //!
-//! The signature is *admission control only* — it is not measured, and the key
+//! The signature is *admission control only*: it is not measured, and the key
 //! is not measured. The attestation surface stays minimal: PCR 14 records the
 //! SHA-256 of whatever binary actually ran, full stop.
 

@@ -4,9 +4,6 @@ set -euo pipefail
 # Get the absolute path of the script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Setup secure boot keys (relative to script directory)
-KEYDIR="${SCRIPT_DIR}/keys"
-
 # Get architecture from environment (default to x86_64)
 ARCH=${ARCH:-x86_64}
 
@@ -16,14 +13,9 @@ echo "=== Building UKI for Fedora 41 (${ARCH}) ==="
 OUTPUT_DIR="${SCRIPT_DIR}/${ARCH}"
 mkdir -p "${OUTPUT_DIR}/tmp"
 
-# Determine the correct systemd-efistub filename, PE format, and objcopy command based on architecture
-if [ "${ARCH}" = "x86_64" ]; then
-    PE_FORMAT="pei-x86-64"
-    OBJCOPY="x86_64-linux-gnu-objcopy"
-elif [ "${ARCH}" = "aarch64" ]; then
-    PE_FORMAT="pei-aarch64-little"
-    OBJCOPY="aarch64-linux-gnu-objcopy"
-else
+# Validate the target architecture (mkuki handles PE assembly in-process, so no
+# arch-specific objcopy/PE-format selection is needed here anymore).
+if [ "${ARCH}" != "x86_64" ] && [ "${ARCH}" != "aarch64" ]; then
     echo "ERROR: Unsupported architecture: ${ARCH}"
     exit 1
 fi
@@ -72,27 +64,30 @@ if [ -f "${KERNEL_CONFIG_PATH}" ]; then
     echo ""
 fi
 
-# Build minimal initramfs
-echo "Building minimal initramfs..."
-INITRD_PATH="${OUTPUT_DIR}/initrd-${KERNEL_VERSION}.img"
-INITRAMFS_DIR="${OUTPUT_DIR}/tmp/initramfs-$$"
+# Build the layered initramfs as two reproducible layers that mkuki concatenates
+# into one .initrd (the kernel unpacks concatenated cpios as one rootfs):
+#   platform = kernel modules + depmod metadata (version-locked to the kernel)
+#   userland = busybox + init + udhcpc + stage1 (kernel-agnostic)
+echo "Staging initramfs layers..."
+PLATFORM_DIR="${OUTPUT_DIR}/tmp/layer-platform-$$"
+USERLAND_DIR="${OUTPUT_DIR}/tmp/layer-userland-$$"
 
-# Create directory structure
-mkdir -p "${INITRAMFS_DIR}"/{bin,sbin,etc,proc,sys,dev,lib,lib64,tmp}
-
-# Copy busybox and create symlinks
+# --- userland layer ---
+mkdir -p "${USERLAND_DIR}"/{bin,sbin,etc,proc,sys,dev,lib,lib64,tmp}
 echo "Installing busybox..."
-cp "${OUTPUT_DIR}/busybox" "${INITRAMFS_DIR}/bin/"
-
-# Copy stage1 binary
+cp "${OUTPUT_DIR}/busybox" "${USERLAND_DIR}/bin/"
 echo "Installing stage1..."
-cp "${OUTPUT_DIR}/stage1" "${INITRAMFS_DIR}/bin/stage1"
-chmod +x "${INITRAMFS_DIR}/bin/stage1"
+cp "${OUTPUT_DIR}/stage1" "${USERLAND_DIR}/bin/stage1"
+chmod +x "${USERLAND_DIR}/bin/stage1"
+cp "${SCRIPT_DIR}/init" "${USERLAND_DIR}/init"
+chmod +x "${USERLAND_DIR}/init"
+cp "${SCRIPT_DIR}/udhcpc.script" "${USERLAND_DIR}/bin/udhcpc.script"
+chmod +x "${USERLAND_DIR}/bin/udhcpc.script"
 
-# Copy required kernel modules
+# --- platform layer (kernel modules) ---
 echo "Copying kernel modules..."
 MODULES_SRC="${OUTPUT_DIR}/tmp/lib/modules/${KERNEL_VERSION}"
-MODULES_DST="${INITRAMFS_DIR}/lib/modules/${KERNEL_VERSION}"
+MODULES_DST="${PLATFORM_DIR}/lib/modules/${KERNEL_VERSION}"
 mkdir -p "${MODULES_DST}/kernel/drivers"
 
 # Copy required modules for cloud instances (AWS EC2, GCP Confidential VMs)
@@ -152,27 +147,13 @@ for modfile in modules.order modules.builtin modules.builtin.modinfo; do
     fi
 done
 
-# Run depmod to generate modules.dep
-depmod -b "${INITRAMFS_DIR}" "${KERNEL_VERSION}"
+# Run depmod to generate modules.dep inside the platform layer.
+depmod -b "${PLATFORM_DIR}" "${KERNEL_VERSION}"
 
-# Copy init script
-cp "${SCRIPT_DIR}/init" "${INITRAMFS_DIR}/init"
-chmod +x "${INITRAMFS_DIR}/init"
-
-cp "${SCRIPT_DIR}/udhcpc.script" "${INITRAMFS_DIR}/bin/udhcpc.script"
-chmod +x "${INITRAMFS_DIR}/bin/udhcpc.script"
-
-# Create the initramfs archive (reproducible build)
-echo "Creating initramfs archive..."
-# Set all file timestamps to epoch for reproducibility (do this LAST after all file operations)
-find "${INITRAMFS_DIR}" -exec touch -h -t 197001010000 {} +
-# Create reproducible cpio archive with sorted file list and no timestamps in gzip
-(cd "${INITRAMFS_DIR}" && find . -print0 | LC_ALL=C sort -z | cpio -o -H newc -0 --reproducible 2>/dev/null || cpio -o -H newc -0) | gzip -n > "${INITRD_PATH}"
-
-# Cleanup
-rm -rf "${INITRAMFS_DIR}"
-
-echo "Initrd created: ${INITRD_PATH}"
+# init + udhcpc.script were staged into the userland layer above. mkuki builds one
+# reproducible gzipped cpio per layer (zeroed uid/gid/mtime, sorted) and concatenates
+# them into .initrd, so no manual cpio/gzip/touch step is needed here.
+echo "Initramfs layers staged: platform + userland"
 
 # Get kernel image path
 KERNEL_PATH="${OUTPUT_DIR}/tmp/lib/modules/${KERNEL_VERSION}/vmlinuz"
@@ -232,9 +213,6 @@ else
 fi
 echo "${CMDLINE_SERIAL} ${CMDLINE_COMMON}" > "${CMDLINE_PATH}"
 
-UNAME_PATH="${OUTPUT_DIR}/uname.txt"
-echo "${KERNEL_VERSION}" > "${UNAME_PATH}"
-
 # Set SOURCE_DATE_EPOCH for reproducible builds
 export SOURCE_DATE_EPOCH=0
 
@@ -251,212 +229,60 @@ echo "VERSION=\"${OSREL_VERSION}\"" >> "${OSREL_PATH}"
 echo "NAME=\"${OSREL_NAME}\"" >> "${OSREL_PATH}"
 echo "PRETTY_NAME=\"${OSREL_NAME} ${OSREL_VERSION}\"" >> "${OSREL_PATH}"
 
-# Calculate BUILD_ID from component hashes
-INITRD_HASH=$(sha256sum "${INITRD_PATH}" | cut -d' ' -f1 | cut -c1-8)
+# BUILD_ID from kernel + cmdline. The authoritative per-layer and full .initrd
+# sha256 are printed by mkuki below (it owns the cpio layer assembly now).
 KERNEL_HASH=$(sha256sum "${KERNEL_PATH}" | cut -d' ' -f1 | cut -c1-8)
 CMDLINE_HASH=$(sha256sum "${CMDLINE_PATH}" | cut -d' ' -f1 | cut -c1-8)
-BUILD_ID="kernel-${KERNEL_VERSION}-${KERNEL_HASH}.cmdline-${CMDLINE_HASH}.initrd-${INITRD_HASH}"
+BUILD_ID="kernel-${KERNEL_VERSION}-${KERNEL_HASH}.cmdline-${CMDLINE_HASH}"
 echo "BUILD_ID=${BUILD_ID}" >> "${OSREL_PATH}"
 
-# Calculate section VMAs dynamically based on the stub's layout.
-# Newer systemd stubs (v256+) use high VMAs that differ from v252's layout,
-# so we append our sections after the stub's last section (same approach as ukify).
-SECTION_ALIGN=0x1000
-NEXT_VMA=$(${OBJCOPY%%objcopy}objdump -h "${STUB_PATH}" | \
-    awk '/^  [0-9]/ { print $3, $4 }' | \
-    while read size_hex vma_hex; do
-        echo $(( 0x${vma_hex} + 0x${size_hex} ))
-    done | sort -n | tail -1)
-NEXT_VMA=$(( (NEXT_VMA + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN ))
+# Assemble the UKI with mkuki (no binutils/objcopy/objdump): it builds one
+# reproducible gzipped cpio per --layer, concatenates them into .initrd, computes
+# the section VMAs from the stub, and grafts the PE sections in-process. Layer
+# order is significant: platform first (provides /lib/modules), then userland
+# (provides /init and /bin/*; later layers overlay earlier ones).
+MKUKI="${SCRIPT_DIR}/mkuki"
+"${MKUKI}" \
+    --layer "${PLATFORM_DIR}" \
+    --layer "${USERLAND_DIR}" \
+    --kernel "${KERNEL_PATH}" \
+    --stub "${STUB_PATH}" \
+    --cmdline "$(cat "${CMDLINE_PATH}")" \
+    --uname "${KERNEL_VERSION}" \
+    --os-release "${OSREL_PATH}" \
+    --out "${UKI_PATH}" \
+    --arch "${ARCH}"
 
-# Place each section sequentially, aligned to SECTION_ALIGN
-calc_next_vma() {
-    local current_vma=$1
-    local file=$2
-    local size
-    size=$(stat -c%s "$file")
-    echo $(( (current_vma + size + SECTION_ALIGN - 1) / SECTION_ALIGN * SECTION_ALIGN ))
-}
+# Drop the staged layer trees now that they are baked into the UKI.
+rm -rf "${PLATFORM_DIR}" "${USERLAND_DIR}"
 
-OSREL_VMA=${NEXT_VMA}
-CMDLINE_VMA=$(calc_next_vma ${OSREL_VMA} "${OSREL_PATH}")
-UNAME_VMA=$(calc_next_vma ${CMDLINE_VMA} "${CMDLINE_PATH}")
-LINUX_VMA=$(calc_next_vma ${UNAME_VMA} "${UNAME_PATH}")
-INITRD_VMA=$(calc_next_vma ${LINUX_VMA} "${KERNEL_PATH}")
-
-echo "UKI section layout:"
-printf "  .osrel   @ 0x%x\n" ${OSREL_VMA}
-printf "  .cmdline @ 0x%x\n" ${CMDLINE_VMA}
-printf "  .uname   @ 0x%x\n" ${UNAME_VMA}
-printf "  .linux   @ 0x%x\n" ${LINUX_VMA}
-printf "  .initrd  @ 0x%x\n" ${INITRD_VMA}
-
-${OBJCOPY} \
-    --input-target="${PE_FORMAT}" \
-    --output-target="${PE_FORMAT}" \
-    --add-section .osrel="${OSREL_PATH}" --change-section-vma .osrel=${OSREL_VMA} \
-    --add-section .cmdline="${CMDLINE_PATH}" --change-section-vma .cmdline=${CMDLINE_VMA} \
-    --add-section .uname="${UNAME_PATH}" --change-section-vma .uname=${UNAME_VMA} \
-    --add-section .linux="${KERNEL_PATH}" --change-section-vma .linux=${LINUX_VMA} \
-    --add-section .initrd="${INITRD_PATH}" --change-section-vma .initrd=${INITRD_VMA} \
-    "${STUB_PATH}" "${UKI_PATH}"
-
-sbsign --key "$KEYDIR/db.crt.key" --cert "$KEYDIR/db.crt" --output "${UKI_PATH}" "${UKI_PATH}"
-
+# stage0 admits and loads the UKI by ed25519/sha256, bypassing the firmware db
+# check (crates/stage0/src/secauth.rs), so the UKI is netboot-only — it needs no
+# disk image, efi-vars, or db signature (those belong to the stage0 release).
+# stage0 is the ONLY db/Authenticode-signed link in the chain: the UKI is admitted
+# by the sha256 pinned in _stage1 (or an ed25519 .sig) plus the PCR 14 measurement,
+# so mkuki's output is shipped verbatim with no sbsign step.
 echo "UKI created: ${UKI_PATH}"
 ls -lh "${UKI_PATH}"
 
 # Copy kernel separately for reference
 cp "${KERNEL_PATH}" "${OUTPUT_DIR}/vmlinuz-${KERNEL_VERSION}"
 
-echo ""
-echo "=== Creating bootable disk image ==="
+# Pin = sha256 of the bytes stage0 fetches and verifies (mkuki's output verbatim).
+UKI_SHA256=$(sha256sum "${UKI_PATH}" | cut -d' ' -f1)
+echo "${UKI_SHA256}  linux.efi" > "${OUTPUT_DIR}/linux.efi.sha256"
 
-# Calculate required disk size based on UKI file size
-# Add overhead for: GPT headers (1MB front + 1MB back), FAT32 overhead (~10%), alignment, and safety margin
-if [ -f "${UKI_PATH}" ]; then
-    UKI_SIZE_BYTES=$(stat -c%s "${UKI_PATH}")
-    UKI_SIZE_MB=$((UKI_SIZE_BYTES / 1024 / 1024 + 1))
-    # Calculate total size: 1MB (front GPT) + partition size + 1MB (back GPT)
-    # Partition size = UKI size * 1.5 (50% overhead for FAT32, alignment, and safety)
-    PARTITION_SIZE_MB=$((UKI_SIZE_MB * 3 / 2))
-    # Ensure minimum partition size of 33MB (FAT32 minimum)
-    if [ ${PARTITION_SIZE_MB} -lt 100 ]; then
-        PARTITION_SIZE_MB=100
-    fi
-    DISK_SIZE_MB=$((PARTITION_SIZE_MB + 2))
-    echo "UKI size: ${UKI_SIZE_MB}MB"
-    echo "Partition size: ${PARTITION_SIZE_MB}MB"
-    echo "Total disk size: ${DISK_SIZE_MB}MB"
-else
-    echo "Error: UKI file not found at ${UKI_PATH}"
-    exit 1
-fi
-
-DISK_IMAGE="${OUTPUT_DIR}/boot.disk"
-
-echo "Creating ${DISK_SIZE_MB}MB disk image..."
-dd if=/dev/zero of="${DISK_IMAGE}" bs=1M count=${DISK_SIZE_MB} status=progress
-
-# Generate deterministic GUIDs from UKI hash for reproducible builds
-echo "Generating deterministic GUIDs from UKI content..."
-UKI_HASH=$(sha256sum "${UKI_PATH}" | cut -d' ' -f1)
-# Create disk GUID from first 32 hex chars of hash
-DISK_GUID="${UKI_HASH:0:8}-${UKI_HASH:8:4}-${UKI_HASH:12:4}-${UKI_HASH:16:4}-${UKI_HASH:20:12}"
-# Create partition GUID from next 32 hex chars
-PART_GUID="${UKI_HASH:32:8}-${UKI_HASH:36:4}-${UKI_HASH:40:4}-${UKI_HASH:44:4}-${UKI_HASH:48:12}"
-echo "Disk GUID: ${DISK_GUID}"
-echo "Partition GUID: ${PART_GUID}"
-
-# Create GPT partition table with deterministic GUIDs using sfdisk
-echo "Creating reproducible GPT partition table..."
-sfdisk "${DISK_IMAGE}" <<EOF
-label: gpt
-label-id: ${DISK_GUID}
-first-lba: 2048
-unit: sectors
-
-start=2048, size=$((((DISK_SIZE_MB - 1) * 1024 * 1024 / 512) - 2048)), type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, uuid=${PART_GUID}, name="EFI System Partition"
-EOF
-
-# Calculate partition offset for mtools access
-PART_INFO=$(sfdisk -d "${DISK_IMAGE}" | grep "start=" | head -1)
-PART_START_SECTOR=$(echo "${PART_INFO}" | sed -n 's/.*start=\s*\([0-9]*\).*/\1/p')
-PART_OFFSET=$((PART_START_SECTOR * 512))
-
-# Format the ESP partition as FAT32 with deterministic volume ID
-echo "Formatting EFI System Partition..."
-# Use first 8 hex chars of hash as volume ID for reproducibility
-VOLUME_ID="${UKI_HASH:0:8}"
-
-# Setup loop device for the partition
-LOOP_DEVICE=$(losetup -f --show -o "${PART_OFFSET}" "${DISK_IMAGE}")
-mkfs.vfat -F 32 -n "EFISYS" -i "${VOLUME_ID}" "${LOOP_DEVICE}"
-losetup -d "${LOOP_DEVICE}"
-
-# Create EFI boot directory structure by mounting with timestamp control
-echo "Creating EFI boot structure..."
-# Setup loop device for the partition to mount it
-LOOP_DEVICE=$(losetup -f --show -o "${PART_OFFSET}" "${DISK_IMAGE}")
-
-# Mount with options to minimize timestamp updates
-MOUNT_DIR="${OUTPUT_DIR}/tmp/esp-mount-$$"
-mkdir -p "${MOUNT_DIR}"
-mount -o noatime,nodiratime,tz=UTC "${LOOP_DEVICE}" "${MOUNT_DIR}"
-
-# Create EFI boot directory structure
-mkdir -p "${MOUNT_DIR}/EFI/BOOT"
-
-# Determine the correct boot filename based on architecture
-if [ "${ARCH}" = "x86_64" ]; then
-    BOOT_EFI="BOOTX64.EFI"
-elif [ "${ARCH}" = "aarch64" ]; then
-    BOOT_EFI="BOOTAA64.EFI"
-fi
-
-# Copy the UKI as the correct boot file
-cp "${UKI_PATH}" "${MOUNT_DIR}/EFI/BOOT/${BOOT_EFI}"
-echo "Copied UKI to EFI/BOOT/${BOOT_EFI}"
-
-# Set all timestamps to FAT32 minimum (1980-01-01) for reproducibility
-# This must be done before unmount
-find "${MOUNT_DIR}" -exec touch -h -d "1980-01-01 00:00:00 UTC" {} +
-
-# Verify the file was copied
-echo "Contents of EFI/BOOT:"
-ls -lh "${MOUNT_DIR}/EFI/BOOT/"
-
-# Sync and unmount
-sync
-umount "${MOUNT_DIR}"
-rmdir "${MOUNT_DIR}"
-losetup -d "${LOOP_DEVICE}"
-
-# Normalize all FAT timestamps for reproducibility
-echo "Normalizing FAT timestamps for reproducibility..."
-"${SCRIPT_DIR}/normalize-fat-timestamps.py" "${DISK_IMAGE}" "${PART_OFFSET}"
-
-echo "Disk image created: ${DISK_IMAGE}"
-ls -lh "${DISK_IMAGE}"
-
-# Verify the disk image
-echo ""
-echo "=== Verifying disk image ==="
-sfdisk -l "${DISK_IMAGE}"
-
-# Get disk image size for AWS import
-IMAGE_SIZE_BYTES=$(stat -c%s "${DISK_IMAGE}")
-IMAGE_SIZE_GB=$((IMAGE_SIZE_BYTES / 1024 / 1024 / 1024 + 1))
-echo "Disk image size: ${IMAGE_SIZE_BYTES} bytes (~${IMAGE_SIZE_GB}GB)"
-
-
-# Use architecture-specific OVMF vars template
-if [ "${ARCH}" = "x86_64" ]; then
-    OVMF_VARS_ORIG="/usr/share/OVMF/OVMF_VARS_4M.fd"
-elif [ "${ARCH}" = "aarch64" ]; then
-    # Use snakeoil (test keys) version which has proper structure for virt-fw-vars
-    OVMF_VARS_ORIG="/usr/share/AAVMF/AAVMF_VARS.snakeoil.fd"
-fi
-
-EFI_VARS_OVMF="${OUTPUT_DIR}/efi-vars.ovmf"
-EFI_VARS_AWS="${OUTPUT_DIR}/efi-vars.aws"
-if [ ! -f "${OVMF_VARS_ORIG}" ]; then
-    echo "Error: ${OVMF_VARS_ORIG} not found. Install ovmf/qemu-efi-aarch64 package."
-    exit 1
-fi
-
-# Copy OVMF_VARS if it doesn't exist (preserves any previous state)
-# With DeployedMode=1 the KEK and PK can't be used to update the variables
-echo "Creating EFI vars (OVMF+AWS)"
-#cert-to-efi-sig-list -g `cat "$KEYDIR/PK.guid"` "$KEYDIR/PK.crt" "$KEYDIR/PK.esl"
-#cert-to-efi-sig-list -g `cat "$KEYDIR/KEK.guid"` "$KEYDIR/KEK.crt" "$KEYDIR/KEK.esl"
-#cert-to-efi-sig-list -g `cat "$KEYDIR/db.guid"` "$KEYDIR/db.crt" "$KEYDIR/db.esl"
-virt-fw-vars --input "${OVMF_VARS_ORIG}" --output "${EFI_VARS_OVMF}" --output-aws "${EFI_VARS_AWS}" \
-  --add-db `cat "$KEYDIR/db.guid"` "$KEYDIR/db.crt" \
-  --add-kek `cat "$KEYDIR/KEK.guid"` "$KEYDIR/KEK.crt" \
-  --set-pk `cat "$KEYDIR/PK.guid"` "$KEYDIR/PK.crt" \
-  --set-true DeployedMode \
-  --secure-boot
+# Ready-to-paste _stage1 user-data snippet (sha256 admission mode). Deployers who
+# want signed-mode rollforward re-sign linux.efi with their own ed25519 key.
+cat > "${OUTPUT_DIR}/stage0-snippet.json" <<SNIPPET
+{
+  "_stage1": {
+    "${ARCH}": { "url": "https://YOUR-HOST/path/to/linux.efi", "sha256": "${UKI_SHA256}" }
+  }
+}
+SNIPPET
+echo "UKI sha256: ${UKI_SHA256}"
+echo "Wrote ${OUTPUT_DIR}/linux.efi.sha256 and ${OUTPUT_DIR}/stage0-snippet.json"
 
 # Clean up temporary extraction directory
 rm -rf "${OUTPUT_DIR}/tmp"

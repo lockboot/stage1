@@ -1,0 +1,32 @@
+[package]
+name = "mkuki"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Build a stage0-bootable Unified Kernel Image from a kernel + container rootfs, no binutils/systemd required."
+
+# The crate is both a library (import the UKI/cpio/sign building blocks) and the
+# `mkuki` CLI that drives them. Both targets are named `mkuki`.
+[lib]
+name = "mkuki"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mkuki"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+tar = "0.4"
+walkdir = "2"
+sha2 = "0.10"
+base64 = "0.22"
+# Same ed25519 implementation stage0 verifies with (crates/stage0/src/sig.rs),
+# so a signature this tool emits is exactly what stage0's admission check expects.
+ed25519-compact = "2.3"
+# Structured, multi-level logging. The library only *emits* events; the binary
+# installs the subscriber (see main.rs) so importers control their own logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

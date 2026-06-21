@@ -8,6 +8,12 @@ license = "MIT OR Apache-2.0"
 # of the parent lockboot workspace (which defaults to a musl target).
 [workspace]
 
+[features]
+# Verbose per-connection/per-request/per-segment network trace via `sdbg!`. Off by
+# default (the milestone log + boot-clock timestamps suffice); build with
+# `--features verbose` to debug DNS/TCP/HTTP behaviour.
+verbose = []
+
 [dependencies]
 # UEFI runtime: entry point, boot services, protocols (HTTP, TCG2, LoadImage).
 uefi = { version = "0.35", features = ["alloc", "global_allocator", "panic_handler"] }

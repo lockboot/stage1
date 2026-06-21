@@ -24,6 +24,9 @@ Options:
   --ovmf-vars <path>       Override the OVMF/EFI variables file.
   --payload <path>         (stage0) Serve this UEFI payload over HTTP at
                            http://10.0.2.1:8000/payload.efi for stage0 to fetch.
+  --serve-dir <path>       (stage0) Serve this whole directory at
+                           http://10.0.2.1:8000/ instead of a single payload. Used
+                           by the full chain (UKI at /linux.efi, stage2 at /stage2).
   --trace                  Capture the guest's TCP traffic on tap0 to a pcap at
                            stage0-trace.pcap in the repo root (bind-mounted, so it
                            persists on the host). Open in Wireshark / tshark to
@@ -46,6 +49,7 @@ BOOT_DISK=""
 USER_DATA=""
 OVMF_VARS_OVERRIDE=""
 PAYLOAD=""
+SERVE_DIR=""
 TRACE=0
 
 while [ $# -gt 0 ]; do
@@ -56,6 +60,7 @@ while [ $# -gt 0 ]; do
         --user-data) USER_DATA="$2"; shift 2 ;;
         --ovmf-vars) OVMF_VARS_OVERRIDE="$2"; shift 2 ;;
         --payload)   PAYLOAD="$2"; shift 2 ;;
+        --serve-dir) SERVE_DIR="$2"; shift 2 ;;
         --trace)     TRACE=1; shift ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -217,24 +222,29 @@ echo $! > $TMP/ec2-mock.pid
 # Give services time to start
 sleep 1
 
-# Optionally serve the stage0 payload over HTTP on the tap gateway, so a
-# `_stage0` user-data can point at http://10.0.2.1:8000/payload.efi.
-if [ -n "${PAYLOAD}" ]; then
-    if [ ! -f "${PAYLOAD}" ]; then
-        echo "Error: payload ${PAYLOAD} not found"; exit 1
-    fi
-    PAYLOAD_DIR=$(mktemp -d)
-    cp "${PAYLOAD}" "${PAYLOAD_DIR}/payload.efi"
-    # In signed mode stage0 also fetches a detached signature at <url>.sig;
-    # serve it alongside the payload if the build produced one.
-    [ -f "${PAYLOAD}.sig" ] && cp "${PAYLOAD}.sig" "${PAYLOAD_DIR}/payload.efi.sig"
-    # Serve over HTTP/1.1 (with Content-Length + keep-alive). The default
-    # `python -m http.server` speaks HTTP/1.0 with `Connection: close`, which
-    # OVMF's HttpDxe does not complete the response token for. Real cloud object
-    # stores (S3/GCS) serve HTTP/1.1, so this matches production.
-    ( cd "${PAYLOAD_DIR}" && exec python3 -c 'import http.server; http.server.SimpleHTTPRequestHandler.protocol_version="HTTP/1.1"; http.server.ThreadingHTTPServer(("10.0.2.1",8000), http.server.SimpleHTTPRequestHandler).serve_forever()' ) &
+# Serve a local tree over HTTP on the tap gateway, so `_stage1`/`_stage2` user-data
+# can point at http://10.0.2.1:8000/<file>. --serve-dir serves a prepared directory
+# (full chain: /linux.efi for stage0, /stage2 for stage1); --payload wraps a single
+# file as /payload.efi (stage0 isolation).
+SERVE_ROOT=""
+if [ -n "${SERVE_DIR}" ]; then
+    [ -d "${SERVE_DIR}" ] || { echo "Error: serve-dir ${SERVE_DIR} not found"; exit 1; }
+    SERVE_ROOT="${SERVE_DIR}"
+elif [ -n "${PAYLOAD}" ]; then
+    [ -f "${PAYLOAD}" ] || { echo "Error: payload ${PAYLOAD} not found"; exit 1; }
+    SERVE_ROOT=$(mktemp -d)
+    cp "${PAYLOAD}" "${SERVE_ROOT}/payload.efi"
+    # In signed mode stage0 also fetches a detached signature at <url>.sig.
+    [ -f "${PAYLOAD}.sig" ] && cp "${PAYLOAD}.sig" "${SERVE_ROOT}/payload.efi.sig"
+fi
+if [ -n "${SERVE_ROOT}" ]; then
+    # Serve HTTP/1.1 (Content-Length + keep-alive). The stdlib `http.server` default
+    # is HTTP/1.0 `Connection: close`, which OVMF's HttpDxe never completes the
+    # response token for. Real object stores (S3/GCS) serve HTTP/1.1.
+    ( cd "${SERVE_ROOT}" && exec python3 -c 'import http.server; http.server.SimpleHTTPRequestHandler.protocol_version="HTTP/1.1"; http.server.ThreadingHTTPServer(("10.0.2.1",8000), http.server.SimpleHTTPRequestHandler).serve_forever()' ) &
     echo $! > $TMP/payload-http.pid
-    echo "Serving payload (HTTP/1.1) at http://10.0.2.1:8000/payload.efi (sha256 $(sha256sum "${PAYLOAD}" | cut -d' ' -f1))"
+    echo "Serving ${SERVE_ROOT} (HTTP/1.1) at http://10.0.2.1:8000/ :"
+    ls -l "${SERVE_ROOT}" | sed 's/^/  /'
 fi
 
 echo 1 > /proc/sys/net/ipv4/ip_forward

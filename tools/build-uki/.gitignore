@@ -3,3 +3,5 @@
 x86_64
 aarch64
 *-linux-*
+# mkuki host build tool (built by `make tools/build-uki/mkuki`)
+/mkuki
