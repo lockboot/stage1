@@ -1,38 +1,109 @@
-.PRECIOUS: tools/build-uki/keys/% tools/build-uki/% \
-	tools/build-stage0/%/stage0.efi tools/build-stage0/%/payload.efi tools/build-stage0/%/stage2 tools/build-stage0/%/boot.disk
+# stage1 - the netboot UKI (Linux stage1 + example leaf). Standalone build + test.
+#
+#   make / make build         build the netboot UKI linux.efi (both arches)
+#   make x86_64 | aarch64     build the UKI for one arch
+#   make stage2-<arch>        build the example-stage2 leaf payload
+#   make test-chain-<arch>    boot the whole chain under QEMU, using the EXTERNAL
+#                             stage0 as the harness (../stage0/build/<arch>/boot.disk)
+# Knobs for test-chain:
+#   SIGN=1                    admit the UKI by ed25519 signature instead of sha256
+#   STAGE0_DIR=../stage0      where the sibling stage0 boot.disk is built
+#   STAGE0_BOOT_DISK=<path>   explicit boot.disk (out-of-workspace escape hatch)
+#   TRACE=1                   capture the guest TCP stream to ./stage0-trace.pcap
+
+.PRECIOUS: tools/build-uki/% build/%/stage2 build/%/linux.efi.sig
 
 all: build
 
-ARCHS=x86_64 aarch64
+ARCHS = x86_64 aarch64
+.PHONY: build
 build: $(ARCHS)
 
+.PHONY: amd64 x86_64 arm64 aarch64
 amd64 x86_64: tools/build-uki/x86_64/linux.efi
 arm64 aarch64: tools/build-uki/aarch64/linux.efi
 
+# Reference production _stage1/_stage2 doc (served from S3 in prod).
 DEFAULT_STAGE2_URL = https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.json
 user-data.json:
 	wget -O "$@" $(DEFAULT_STAGE2_URL)
 
-# Docker image names
-BUILD_IMAGE = lockboot:build
-DEV_IMAGE = lockboot:dev
+# ---- Docker images (shared lockboot family; built locally, never published) ----
+# BUILD_IMAGE compiles everything; HARNESS_IMAGE (from stage0) runs the qemu chain
+# test. Both are built by the workspace `make image` from stage0 (the canonical
+# Dockerfiles); a standalone CI clone builds BUILD_IMAGE itself via docker-build-base.
+BUILD_IMAGE   = lockboot:build
+HARNESS_IMAGE = lockboot:harness
 RUNTIME_IMAGE ?= lockboot:latest
 
-# Snakeoil Secure Boot keys, generated fresh per build (openssl + uuidgen). Run in
-# the build container so a slim host / CI runner without those tools still works.
-tools/build-uki/keys/%: docker-build-base
-	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) make -C tools/build-uki/keys
+.PHONY: docker-build-base
+docker-build-base:
+	docker build -f Dockerfile.build -t $(BUILD_IMAGE) .
 
-clean:
-	rm -rf tools/build-uki/x86_64/boot.disk tools/build-uki/x86_64/stage1 tools/build-uki/x86_64/tmp tools/build-uki/x86_64/*.img tools/build-uki/x86_64/*.efi tools/build-uki/x86_64/config-* tools/build-uki/x86_64/efi-vars.ovmf
-	rm -rf tools/build-uki/aarch64/boot.disk tools/build-uki/aarch64/stage1 tools/build-uki/aarch64/tmp tools/build-uki/aarch64/*.img tools/build-uki/aarch64/*.efi tools/build-uki/aarch64/config-* tools/build-uki/aarch64/efi-vars.ovmf
-	rm -rf tools/build-stage0/x86_64 tools/build-stage0/aarch64
-	rm -f tools/build-uki/mkuki
+# ---- Docker run plumbing (keep identical across repos; mirrors stage0/Makefile) ----
+# Own build artifacts by whoever owns the checkout, not the caller's euid. Under
+# `gh act` the caller is root but the bind-mounted tree is still yours, so stat
+# keeps output user-owned instead of trampling the project dir with root files.
+USER_ID  := $(shell stat -c %u .)
+GROUP_ID := $(shell stat -c %g .)
 
-distclean: clean
-	$(MAKE) -C tools/build-uki clean
-	$(MAKE) -C tools/build-uki/keys clean
-	$(MAKE) -C tools/qemu-test clean
+KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
+KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
+DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
+
+# Recursive-docker passthrough: the UKI rule and runtime-image build shell out to
+# the HOST docker daemon (rootfs extraction / buildx), so forward the socket + gid.
+DOCKER_SOCK_GID   := $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo "")
+DOCKER_SOCK_MOUNT := $(shell test -e /var/run/docker.sock && echo "-v /var/run/docker.sock:/var/run/docker.sock")
+DOCKER_OPT_DOCKER := $(DOCKER_SOCK_MOUNT) $(if $(DOCKER_SOCK_GID),--group-add $(DOCKER_SOCK_GID))
+
+DOCKER_SAMEUSER := -u $(USER_ID):$(GROUP_ID)
+
+# Host-path translation for docker-in-devcontainer. Inside the devcontainer /src is
+# a host bind mount and the inner Docker talks to the HOST daemon, which cannot
+# resolve /src/... paths; translate $(CURDIR) to the real host path (the bracketed
+# subpath findmnt reports for the /src bind). On the host CURDIR is not under /src,
+# so this is a pass-through and your workflow is unchanged. Keep identical across repos.
+HOST_DIR := $(CURDIR)
+ifneq ($(filter /src/%,$(CURDIR)),)
+  SRC_BIND := $(shell findmnt -fnro SOURCE --target /src 2>/dev/null | sed -n 's/.*\[\(.*\)\]$$/\1/p')
+  ifneq ($(SRC_BIND),)
+    HOST_DIR := $(SRC_BIND)$(CURDIR:/src%=%)
+  endif
+endif
+
+# Mount the WORKSPACE (parent of this repo) at /src so builds reuse the shared
+# workspace-level .cargo/.rustup (matching the devcontainer), instead of creating
+# per-repo copies. The repo then lives at /src/$(REPO_NAME).
+REPO_NAME := $(notdir $(HOST_DIR))
+HOST_WS   := $(patsubst %/,%,$(dir $(HOST_DIR)))
+
+# Under CI / `gh act` (CI=true, runs as root) keep cargo/rustup caches ephemeral
+# inside the container, so root-owned dirs never land in the bind-mounted project.
+# Locally (no CI) the image's CARGO_HOME=/src/.cargo + RUSTUP_HOME=/src/.rustup win,
+# i.e. the shared workspace caches.
+CACHE_ENV := $(if $(CI),-e CARGO_HOME=/tmp/.cargo -e RUSTUP_HOME=/tmp/.rustup)
+
+DOCKER_RUN = docker run --rm \
+	--privileged \
+	-v $(HOST_WS):/src \
+	-h lockboot \
+	--add-host lockboot:127.0.0.1 \
+	-e OWNER_UID=$(USER_ID) \
+	-e OWNER_GID=$(GROUP_ID) \
+	$(CACHE_ENV) \
+	-w /src/$(REPO_NAME)
+
+docker-shell-base: docker-build-base
+	$(DOCKER_RUN) -ti $(DOCKER_SAMEUSER) $(DOCKER_OPT_DOCKER) $(DOCKER_OPT_KVM) $(BUILD_IMAGE) bash
+
+docker-clean:
+	docker rmi $(BUILD_IMAGE) || true
+
+
+#####################################################################
+# UKI build (stage0 serves linux.efi over the network and admits it by
+# sha256 + PCR 14; it is a netboot payload, not a bootable disk).
 
 # Download + extract UKI dependencies in the build container, which has the tools
 # (rpm2cpio, cpio, curl, xz); the host / CI runner may not (e.g. act's slim image).
@@ -49,107 +120,17 @@ tools/build-uki/%/kernel-core.rpm: docker-build-base
 tools/build-uki/%/kernel-modules-core.rpm: docker-build-base
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) make -C tools/build-uki $*/kernel-modules-core.rpm
 
-tools/qemu-test/%:
-	$(MAKE) -C tools/qemu-test $*
-
-
-#####################################################################
-# Docker build
-
-docker-build-base:
-	docker build -f Dockerfile.build -t $(BUILD_IMAGE) .
-
-# Build the dev image (extends build image)
-docker-build-dev: docker-build-base
-	docker build -f Dockerfile.dev -t $(DEV_IMAGE) .
-
-# Alias for building both
-docker-build: docker-build-dev
-
-docker-clean:
-	docker rmi $(BUILD_IMAGE) $(DEV_IMAGE) || true
-
-docker-dev: build run
-
-docker-prune-system-wide:
-	docker image prune -f
-	docker system prune -f
-	docker system prune -f --volumes
-	docker system df
-
-# Setup buildx builder (run once)
-docker-buildx-setup:
-	docker buildx create --name lockboot-builder --use || docker buildx use lockboot-builder
-	docker buildx inspect --bootstrap
-
-# Build runtime image for current platform only and load into Docker
-docker-runtime: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
-	docker buildx build \
-		-f Dockerfile.runtime \
-		-t $(RUNTIME_IMAGE) \
-		--load \
-		.
-
-# Build multi-arch and export to OCI tar (for local multi-arch without registry)
-docker-runtime-oci: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
-	docker buildx build \
-		--platform linux/amd64,linux/arm64 \
-		-f Dockerfile.runtime \
-		-t $(RUNTIME_IMAGE) \
-		--output type=oci,dest=lockboot.oci \
-		.
-
-.PHONY: docker-buildx-setup docker-runtime docker-runtime-push docker-runtime-oci
-
-
-#####################################################################
-# Docker run
-
-USER_ID := $(shell id -u)
-GROUP_ID := $(shell id -g)
-
-# Options for giving docker kvm access
-KVM_GID := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
-KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
-DOCKER_GROUP_KVM := $(if $(KVM_GID),--group-add $(KVM_GID))
-DOCKER_OPT_KVM := $(DOCKER_GROUP_KVM) $(KVM_MOUNT)
-
-# Options for recursive docker
-DOCKER_SOCK_GID := $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo "")
-DOCKER_SOCK_MOUNT := $(shell test -e /var/run/docker.sock && echo "-v /var/run/docker.sock:/var/run/docker.sock")
-DOCKER_GROUP_DOCKER := $(if $(DOCKER_SOCK_GID),--group-add $(DOCKER_SOCK_GID))
-DOCKER_OPT_DOCKER := $(DOCKER_SOCK_MOUNT) $(DOCKER_GROUP_DOCKER)
-
-DOCKER_SAMEUSER := -u $(USER_ID):$(GROUP_ID)
-
-# Base docker run command with all common flags
-DOCKER_RUN = docker run --rm \
-	--privileged \
-	-v $(CURDIR):/src \
-	-h lockboot \
-	--add-host lockboot:127.0.0.1 \
-	-e OWNER_UID=$(USER_ID) \
-	-e OWNER_GID=$(GROUP_ID) \
-	-w /src
-
-docker-shell-base: docker-build-base
-	$(DOCKER_RUN) -ti $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash
-
-docker-shell-dev: docker-build-dev
-	$(DOCKER_RUN) -ti $(DOCKER_SAMEUSER) $(DOCKER_OPT_DOCKER) $(DOCKER_OPT_KVM) $(DEV_IMAGE) bash
-
-# Build the netboot UKI (linux.efi) for a specific architecture. stage0 serves
-# this as a file and admits it by sha256 + PCR 14; it is not a bootable disk.
+# Build the netboot UKI (linux.efi) for a specific architecture. build.sh extracts
+# a rootfs via the HOST docker daemon, so DOCKER_OPT_DOCKER forwards the socket.
 tools/build-uki/%/linux.efi: tools/build-uki/%/busybox tools/build-uki/%/stage1 tools/build-uki/%/stub.efi tools/build-uki/%/kernel-core.rpm tools/build-uki/%/kernel-modules-core.rpm tools/build-uki/mkuki
 	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* \
 		$(BUILD_IMAGE) ./tools/build-uki/build.sh
 
 # Build AND extract stage1 inside the one container step, so the cp runs where
 # target/ exists rather than in the host/make context, which may not see the build
-# container's target dir under nested docker (e.g. `act`). `cp -v` also surfaces the
-# real artifact path in the log if it ever goes missing again. --exclude mkuki: it
-# is a build-host tool, built separately for x86_64 by the tools/build-uki/mkuki
-# rule, so it must not be cross-compiled for $* here.
+# container's target dir under nested docker (e.g. `act`). --exclude mkuki: it is a
+# build-host tool, built separately for x86_64 by the tools/build-uki/mkuki rule, so
+# it must not be cross-compiled for $* here.
 tools/build-uki/%/stage1: docker-build-base
 	mkdir -p tools/build-uki/$*
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
@@ -164,136 +145,137 @@ tools/build-uki/mkuki: docker-build-base
 
 
 #####################################################################
-# stage0 (pure-UEFI network bootloader)
+# Runtime container image (busybox + stage1) -> ghcr on uki-v* tags.
 
-STAGE0_DIR = crates/stage0
+docker-buildx-setup:
+	docker buildx create --name lockboot-builder --use || docker buildx use lockboot-builder
+	docker buildx inspect --bootstrap
 
-# Guard the arch-less forms so `make stage0` / `boot-stage0` / `test-stage0` print
-# a helpful message instead of "no rule to make target". Require an explicit arch.
-.PHONY: stage0 boot-stage0 test-stage0 test-chain
-stage0 boot-stage0 test-stage0 test-chain:
-	@echo "'$@' needs an architecture suffix, e.g. 'make $@-x86_64' or 'make $@-aarch64'." >&2
-	@exit 2
+docker-runtime: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
+	docker buildx build -f Dockerfile.runtime -t $(RUNTIME_IMAGE) --load .
 
-# Build the stage0 UEFI binary inside the build container. Same model as stage1:
-# cargo runs in the container (never the host) and vaportpm is pulled from git,
-# so only this repo is mounted.
-tools/build-stage0/%/stage0.efi: docker-build-base
-	mkdir -p tools/build-stage0/$*
-	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-uefi && cargo build --release --manifest-path $(STAGE0_DIR)/Cargo.toml --target $*-unknown-uefi && cp -v $(STAGE0_DIR)/target/$*-unknown-uefi/release/stage0.efi $@"
+docker-runtime-oci: tools/build-uki/x86_64/busybox tools/build-uki/x86_64/stage1 tools/build-uki/aarch64/busybox tools/build-uki/aarch64/stage1
+	docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.runtime -t $(RUNTIME_IMAGE) --output type=oci,dest=lockboot.oci .
 
-# Assemble + sign the stage0 boot disk (losetup/mount -> privileged container).
-tools/build-stage0/%/boot.disk: tools/build-stage0/%/stage0.efi tools/build-uki/keys/db.crt
-	$(DOCKER_RUN) -e ARCH=$* $(BUILD_IMAGE) ./tools/build-stage0/build.sh
-
-stage0-amd64 stage0-x86_64: tools/build-stage0/x86_64/boot.disk
-stage0-arm64 stage0-aarch64: tools/build-stage0/aarch64/boot.disk
-
-# Host:port the local payload server answers on. A hostname (not an IP literal) so
-# the test also exercises EFI_DNS4 / the guest resolver; boot.sh maps it to
-# 10.0.2.1 in the QEMU DNS. Override SERVE_HOST=10.0.2.1:8000 to skip DNS.
-SERVE_HOST ?= payload.lockboot.test:8000
-PAYLOAD_URL ?= http://$(SERVE_HOST)/payload.efi
-
-# Shared QEMU-in-dev-container invocation for stage0 boots. The tap/iptables setup
-# needs NET_ADMIN + a tun device; KVM is added when available.
-STAGE0_QEMU = $(DOCKER_RUN) $(DOCKER_OPT_KVM) \
-	-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
-	$(DEV_IMAGE) ./tools/qemu-test/boot.sh --kind stage0
-
-# Boot stage0 under QEMU. With no arguments this builds and serves the signed
-# end-to-end test payload, so `make boot-stage0-x86_64` works on its own. Knobs:
-#   PAYLOAD=path/to/your.efi  serve a custom payload instead. Pinned by sha256, or
-#                             by the release ed25519 key when a `<payload>.sig` and
-#                             tools/build-stage0/keys/release.pub.b64 both exist.
-#   USER_DATA=path/to.json    serve this `_stage1` doc verbatim (point its URL at
-#                             anything the guest reaches); skips doc generation.
-#   TRACE=1                   capture the guest TCP stream to stage0-trace.pcap
-#                             (needs the dev image rebuilt: 'make docker-build-dev').
-#
-# user-data.stage0.json (gitignored) is regenerated every run to match the payload,
-# so it can never go stale. It is deliberately NOT a make-prerequisite: a missing
-# one must not disqualify this rule.
-boot-stage0-%: tools/qemu-test/ec2-metadata-mock-linux-amd64 tools/build-stage0/%/boot.disk tools/build-stage0/%/payload.efi
-	@P="$(PAYLOAD)"; [ -n "$$P" ] || P="tools/build-stage0/$*/payload.efi"; \
-	if [ -n "$(USER_DATA)" ]; then \
-		cp "$(USER_DATA)" user-data.stage0.json; \
-		echo "Using user-data from $(USER_DATA)"; \
-	elif [ -f "$$P.sig" ] && [ -f tools/build-stage0/keys/release.pub.b64 ]; then \
-		PUB=$$(cat tools/build-stage0/keys/release.pub.b64); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": "%s", "ed25519": "%s" }\n  }\n}\n' \
-			"$*" "$(PAYLOAD_URL)" "$$PUB" > user-data.stage0.json; \
-		echo "Wrote user-data.stage0.json (signed mode, release pubkey $$PUB)"; \
-	else \
-		SHA=$$(sha256sum "$$P" | cut -d' ' -f1); \
-		printf '{\n  "_stage1": {\n    "%s": { "url": "%s", "sha256": "%s" }\n  }\n}\n' \
-			"$*" "$(PAYLOAD_URL)" "$$SHA" > user-data.stage0.json; \
-		echo "Wrote user-data.stage0.json (sha256 mode, $$SHA)"; \
-	fi; \
-	$(STAGE0_QEMU) --arch $* --payload "$$P" $(if $(TRACE),--trace)
-
-# Long-term ed25519 release signing key for stage0 "signed mode". This is the
-# vendor key that signs payloads; it never touches a deployed machine — stage0
-# only ever sees the *public* key, pinned in the metadata doc. Generated once in
-# the build container (gitignored). release.pub.b64 is the raw 32-byte public
-# key, base64-encoded, ready to drop straight into the _stage1 `ed25519` field.
-tools/build-stage0/keys/release.pem: docker-build-base
-	mkdir -p tools/build-stage0/keys
-	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
-		openssl genpkey -algorithm ed25519 -out tools/build-stage0/keys/release.pem && \
-		openssl pkey -in tools/build-stage0/keys/release.pem -pubout -outform DER \
-			| tail -c 32 | base64 -w0 > tools/build-stage0/keys/release.pub.b64"
-
-# Build the end-to-end test payload (a chain-loaded UEFI app that reads PCRs) and
-# attach a detached ed25519 signature (payload.efi.sig) made with the release
-# key. The payload is NOT Secure Boot db-signed: stage0 verifies the signature
-# against the pinned pubkey and loads it via a FileAuthentication override. It is
-# served at $(PAYLOAD_URL) (a hostname, so the test exercises EFI_DNS4).
-tools/build-stage0/%/payload.efi: docker-build-base tools/build-stage0/keys/release.pem
-	mkdir -p tools/build-stage0/$*
-	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-uefi && \
-			cargo build --release --manifest-path crates/stage0-test-payload/Cargo.toml --target $*-unknown-uefi && \
-			cp crates/stage0-test-payload/target/$*-unknown-uefi/release/stage0-test-payload.efi $@ && \
-			openssl pkeyutl -sign -inkey tools/build-stage0/keys/release.pem -rawin -in $@ -out $@.sig"
-
-# The signed end-to-end test (build + sign the test payload, pin the release
-# pubkey, boot stage0, fetch/verify/measure/chain-load it) is now the default for
-# `boot-stage0`. This stays as a named alias for it.
-test-stage0-%:
-	$(MAKE) boot-stage0-$* TRACE=$(TRACE)
-
-# Build the example stage2 binary (the leaf stage1 downloads and runs) for the
-# target musl. Served locally by the full-chain test below.
-tools/build-stage0/%/stage2: docker-build-base
-	mkdir -p tools/build-stage0/$*
-	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked -p example-stage2 --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/example-stage2 $@"
-
-# Full-chain end-to-end test: stage0 -> UKI -> stage1 -> example-stage2, all served
-# from one local directory (no S3). A single served user-data carries `_stage1`
-# (stage0 admits the UKI by sha256) and `_stage2` (stage1 admits stage2 by sha256);
-# the two parsers coexist on distinct keys. Both hashes are computed from the local
-# files, so the doc can never go stale.
-test-chain-%: tools/build-uki/%/linux.efi tools/build-stage0/%/stage2 tools/build-stage0/%/boot.disk tools/qemu-test/ec2-metadata-mock-linux-amd64
-	@D="tools/build-stage0/$*/chain"; rm -rf "$$D"; mkdir -p "$$D"; \
-	cp tools/build-uki/$*/linux.efi "$$D/linux.efi"; \
-	cp tools/build-stage0/$*/stage2 "$$D/stage2"; \
-	UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
-	S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
-	printf '{\n  "_stage1": { "%s": { "url": "http://%s/linux.efi", "sha256": "%s" } },\n  "_stage2": { "%s": { "url": "http://%s/stage2", "sha256": "%s" } }\n}\n' \
-		"$*" "$(SERVE_HOST)" "$$UKI_SHA" "$*" "$(SERVE_HOST)" "$$S2_SHA" > user-data.stage0.json; \
-	echo "Wrote user-data.stage0.json (chain: UKI $$UKI_SHA, stage2 $$S2_SHA)"; \
-	$(STAGE0_QEMU) --arch $* --serve-dir "$$D" $(if $(TRACE),--trace)
+.PHONY: docker-buildx-setup docker-runtime docker-runtime-oci
 
 
 #####################################################################
+# example-stage2 leaf (the binary stage1 downloads, verifies, and execs).
 
+build/%/stage2: docker-build-base
+	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
+		bash -c "mkdir -p build/$* && rustup target add $*-unknown-linux-musl && cargo build --release --locked -p example-stage2 --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/example-stage2 build/$*/stage2"
+
+.PHONY: stage2-amd64 stage2-x86_64 stage2-arm64 stage2-aarch64
+stage2-amd64 stage2-x86_64: build/x86_64/stage2
+stage2-arm64 stage2-aarch64: build/aarch64/stage2
+
+
+#####################################################################
+# Full-chain test: stage0 (EXTERNAL harness) -> UKI -> stage1 -> example-stage2
+#
+# stage1 owns no boot apparatus. stage0 IS the harness: we borrow its boot.disk
+# (built in the sibling repo) and the shared lockboot:harness image, and provide
+# only {UKI, leaf, signed/pinned _stage1+_stage2 manifest} - stage0's whole
+# integration surface. Local-only: needs nested KVM, so it never runs on CI.
+
+# Where the external stage0 boot.disk comes from. In-workspace this is the sibling
+# clone; out-of-workspace, point STAGE0_BOOT_DISK at one unpacked from a stage0 release.
+STAGE0_DIR ?= ../stage0
+STAGE0_BOOT_DISK ?= $(STAGE0_DIR)/build/$*/boot.disk
+
+# Host:port the local payload server answers on. Default to the tap gateway IP so
+# BOTH hops are DNS-free: stage0 fetches the UKI (its own DNS4 is exercised by the
+# stage0 repo's tests), and — crucially — stage1 fetches _stage2 from inside the
+# booted Linux guest, whose DNS the shared stage0 harness does not wire for the
+# mapped hostname. Override SERVE_HOST=payload.lockboot.test:8000 to also drive
+# stage0's DNS4 on the _stage1 hop (the _stage2 hop then needs guest DNS).
+SERVE_HOST ?= 10.0.2.1:8000
+
+# ed25519 release key for SIGN=1 (signed-mode admission). stage0 only ever sees the
+# public half, pinned in the _stage1 doc; the private key signs the UKI. Generated
+# in the build container (gitignored under build/keys).
+build/keys/release.pem: docker-build-base
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		mkdir -p build/keys && \
+		openssl genpkey -algorithm ed25519 -out build/keys/release.pem && \
+		openssl pkey -in build/keys/release.pem -pubout -outform DER \
+			| tail -c 32 | base64 -w0 > build/keys/release.pub.b64"
+
+# Detached ed25519 signature over the whole UKI (SIGN=1). Deterministic per RFC 8032,
+# so `openssl pkeyutl -rawin` yields the exact bytes stage0 verifies with the pinned
+# pubkey (same approach stage0 uses to sign its own test payload). Served as
+# linux.efi.sig; stage0 fetches <url>.sig when the manifest carries `ed25519`.
+build/%/linux.efi.sig: tools/build-uki/%/linux.efi build/keys/release.pem
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		mkdir -p build/$* && \
+		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
+			-in tools/build-uki/$*/linux.efi -out build/$*/linux.efi.sig"
+
+# Guard the arch-less form with a helpful message instead of "no rule to make target".
+.PHONY: test-chain
+test-chain:
+	@echo "'$@' needs an arch suffix, e.g. 'make $@-x86_64' or 'make $@-aarch64'." >&2
+	@exit 2
+
+# Full-chain end-to-end test: stage0 -> UKI -> stage1 -> example-stage2, all served
+# from one local dir (no S3). A single served user-data carries `_stage1` (stage0
+# admits the UKI) and `_stage2` (stage1 admits the leaf by sha256); the two parsers
+# coexist on distinct keys. Hashes are computed from the local files so the doc can
+# never go stale. SIGN=1 additionally serves linux.efi.sig and pins the ed25519
+# pubkey for `_stage1` instead of a sha256.
+test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 $(if $(SIGN),build/%/linux.efi.sig)
+	@if [ ! -f "$(STAGE0_BOOT_DISK)" ]; then \
+		echo "Missing external stage0 boot disk: $(STAGE0_BOOT_DISK)" >&2; \
+		echo "Build it first:  (cd $(STAGE0_DIR) && make build-$*)" >&2; \
+		echo "or set STAGE0_BOOT_DISK=<path> to one unpacked from a stage0 release." >&2; \
+		exit 1; \
+	fi
+	@D="build/$*/chain"; rm -rf "$$D"; mkdir -p "$$D"; \
+	cp tools/build-uki/$*/linux.efi "$$D/linux.efi"; \
+	cp build/$*/stage2 "$$D/stage2"; \
+	S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+	if [ -n "$(SIGN)" ]; then \
+		cp build/$*/linux.efi.sig "$$D/linux.efi.sig"; \
+		PUB=$$(cat build/keys/release.pub.b64); \
+		printf '{\n  "_stage1": { "%s": { "url": "http://%s/linux.efi", "ed25519": "%s" } },\n  "_stage2": { "%s": { "url": "http://%s/stage2", "sha256": "%s" } }\n}\n' \
+			"$*" "$(SERVE_HOST)" "$$PUB" "$*" "$(SERVE_HOST)" "$$S2_SHA" > user-data.stage0.json; \
+		echo "Wrote user-data.stage0.json (signed UKI, pubkey $$PUB; stage2 sha256 $$S2_SHA)"; \
+	else \
+		UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
+		printf '{\n  "_stage1": { "%s": { "url": "http://%s/linux.efi", "sha256": "%s" } },\n  "_stage2": { "%s": { "url": "http://%s/stage2", "sha256": "%s" } }\n}\n' \
+			"$*" "$(SERVE_HOST)" "$$UKI_SHA" "$*" "$(SERVE_HOST)" "$$S2_SHA" > user-data.stage0.json; \
+		echo "Wrote user-data.stage0.json (chain: UKI sha256 $$UKI_SHA, stage2 sha256 $$S2_SHA)"; \
+	fi; \
+	$(DOCKER_RUN) $(DOCKER_OPT_KVM) \
+		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
+		$(HARNESS_IMAGE) --kind stage0 --arch $* \
+			--boot-disk "$(STAGE0_BOOT_DISK)" \
+			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace)
+
+
+#####################################################################
+# Housekeeping
+
+.PHONY: clean distclean
+# Remove per-arch build output. Plain rm (no docker needed). build/keys/ (SIGN=1
+# release key) is left in place.
+clean:
+	rm -rf tools/build-uki/x86_64/boot.disk tools/build-uki/x86_64/stage1 tools/build-uki/x86_64/tmp tools/build-uki/x86_64/*.img tools/build-uki/x86_64/*.efi tools/build-uki/x86_64/config-* tools/build-uki/x86_64/efi-vars.ovmf
+	rm -rf tools/build-uki/aarch64/boot.disk tools/build-uki/aarch64/stage1 tools/build-uki/aarch64/tmp tools/build-uki/aarch64/*.img tools/build-uki/aarch64/*.efi tools/build-uki/aarch64/config-* tools/build-uki/aarch64/efi-vars.ovmf
+	rm -rf build/x86_64 build/aarch64
+	rm -f tools/build-uki/mkuki
+
+distclean: clean
+	$(MAKE) -C tools/build-uki clean
+
+
+#####################################################################
 # Git tagging helpers
+
 TAG ?= v0.1.0
 
-# Create and push a new tag (or recreate if it exists)
 tag:
 	@echo "Creating tag: $(TAG)"
 	git tag -d $(TAG) 2>/dev/null || true
@@ -301,16 +283,13 @@ tag:
 	git tag -a $(TAG) -m "Release $(TAG)"
 	git push origin $(TAG)
 
-# Delete a tag locally and remotely
 untag:
 	@echo "Deleting tag: $(TAG)"
 	git tag -d $(TAG) 2>/dev/null || true
 	git push origin :refs/tags/$(TAG) 2>/dev/null || true
 
-# List all tags
 list-tags:
 	git tag -l
 
-# Amend the most recent commit with staged changes
 git-edit:
 	git commit --amend --no-edit

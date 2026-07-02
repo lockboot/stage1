@@ -31,9 +31,9 @@ old
 .docker
 user-data.json
 user-data.stage0.json
-# Ignore stage0 build outputs (x86_64/, aarch64/) and the release key (keys/),
-# but keep tools/build-stage0/build.sh tracked.
-tools/build-stage0/*/
+# Local build outputs: the example-stage2 leaf (build/<arch>/stage2), chain
+# serve-dirs, and the SIGN=1 ed25519 release key (build/keys/) all land here.
+/build/
 .bashrc
 .lesshst
 stage0-trace.*

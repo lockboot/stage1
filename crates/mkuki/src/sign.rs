@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! ed25519 signing + sha256, matching stage0's admission check
-//! (`crates/stage0/src/sig.rs`): the signature is a detached 64-byte ed25519
-//! over the raw payload bytes, the pinned key is the base64 of the 32-byte
-//! public key.
+//! (github.com/lockboot/stage0, crates/stage0/src/sig.rs): the signature is a
+//! detached 64-byte ed25519 over the raw payload bytes, the pinned key is the
+//! base64 of the 32-byte public key. This MUST stay byte-compatible with what
+//! stage0 verifies — the two are a cross-repo wire contract, not a shared crate.
 
 use anyhow::{ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD;

@@ -3,10 +3,10 @@ name: build
 on:
   push:
     branches: [main]
-    # Two independent release tracks, gated by tag prefix:
-    #   stage0-v*  → the Secure Boot root of trust (db-signed, baked into the AMI)
-    #   uki-v*     → the netboot UKI (stage1), admitted by stage0 via sha256 + PCR 14
-    tags: ['stage0-v*', 'uki-v*']
+    # Release track gated by tag prefix:
+    #   uki-v*  → the netboot UKI (stage1), admitted by stage0 via sha256 + PCR 14
+    # (The Secure Boot root of trust ships from the stage0 repo on its own stage0-v* track.)
+    tags: ['uki-v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -22,16 +22,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      # Build BOTH artifacts (ephemeral snakeoil keys) for every push/PR/tag so the
-      # whole chain is validated on each change. One `make` invocation builds the
-      # docker build-image once and produces:
+      # Build the netboot UKI and the example-stage2 leaf for every push/PR/tag. One
+      # `make` builds the docker build-image once (docker-build-base) and produces:
       #   tools/build-uki/<arch>/linux.efi (+ .sha256, snippet, os-release, busybox, stage1)
-      #   tools/build-stage0/<arch>/{boot.disk, BOOT*.EFI, efi-vars.*, *.cer, *.guid}
-      - name: Build UKI + stage0 for ${{ matrix.arch }}
-        run: make ${{ matrix.arch }} stage0-${{ matrix.arch }}
+      #   build/<arch>/stage2 (the example leaf payload)
+      # No workspace / sibling repos needed: vaportpm is pulled from git, stage0 is not
+      # a build-time dependency (it netboots the UKI at runtime).
+      - name: Build UKI + example-stage2 for ${{ matrix.arch }}
+        run: make ${{ matrix.arch }} stage2-${{ matrix.arch }}
 
-      # UKI (stage1) track: the netboot payload + its sha256 pin + the _stage1
-      # snippet, plus busybox/stage1 for the stage1 runtime image.
+      # UKI (stage1) track: the netboot payload + its sha256 pin + the _stage1 snippet,
+      # busybox/stage1 for the runtime image, and the example-stage2 leaf.
       - name: Upload UKI artifacts for ${{ matrix.arch }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -43,60 +44,7 @@ jobs:
             tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/busybox
             tools/build-uki/${{ matrix.arch }}/stage1
-
-      # stage0 track: the firmware-admitted root + the public Secure Boot material
-      # (efi-vars for enrollment, *.cer/*.guid) needed to deploy a cloud image.
-      - name: Upload stage0 artifacts for ${{ matrix.arch }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: stage0-${{ matrix.arch }}
-          path: |
-            tools/build-stage0/${{ matrix.arch }}/boot.disk
-            tools/build-stage0/${{ matrix.arch }}/BOOT*.EFI
-            tools/build-stage0/${{ matrix.arch }}/efi-vars.*
-            tools/build-stage0/${{ matrix.arch }}/os-release
-            tools/build-stage0/${{ matrix.arch }}/*.cer
-            tools/build-stage0/${{ matrix.arch }}/*.guid
-
-  # ---- stage0 release track (tag: stage0-v*) -------------------------------
-  release-stage0:
-    runs-on: ubuntu-latest
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/stage0-v')
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-
-    steps:
-      - name: Download stage0 artifact zips
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts)
-          for arch in x86_64 aarch64; do
-            ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r ".artifacts[] | select(.name==\"stage0-$arch\") | .id")
-            gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > stage0-${arch}.zip
-          done
-
-      - name: Attest stage0 zips
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
-        with:
-          subject-path: |
-            stage0-x86_64.zip
-            stage0-aarch64.zip
-
-      - name: Create stage0 release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            stage0-x86_64.zip
-            stage0-aarch64.zip
-          draft: false
-          prerelease: true
-          generate_release_notes: true
-          make_latest: true
+            build/${{ matrix.arch }}/stage2
 
   # ---- UKI (stage1) release track (tag: uki-v*) ----------------------------
   release-uki:

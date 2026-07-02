@@ -7,13 +7,13 @@
 # it into PCR 14, and chain-loads it. The pin MUST be the sha256 of the FINAL
 # (post-sbsign) linux.efi — exactly the bytes uploaded here.
 #
-# Usage: ./upload-uki.sh <dest-uri> <arch> [version]
+# Usage: ./publish.sh <dest-uri> <arch> [version]
 #   dest-uri : s3://bucket/prefix   or   gs://bucket/prefix
 #   arch     : x86_64 | aarch64
 #   version  : a uki-v* release tag, or 'local' (default) to use a local build
 #
-# Example: ./upload-uki.sh s3://lockboot/uki x86_64 uki-v0.1.0
-#          ./upload-uki.sh gs://lockboot/uki aarch64 local
+# Example: ./publish.sh s3://lockboot/uki x86_64 uki-v0.1.0
+#          ./publish.sh gs://lockboot/uki aarch64 local
 
 set -euo pipefail
 

@@ -257,7 +257,7 @@ MKUKI="${SCRIPT_DIR}/mkuki"
 rm -rf "${PLATFORM_DIR}" "${USERLAND_DIR}"
 
 # stage0 admits and loads the UKI by ed25519/sha256, bypassing the firmware db
-# check (crates/stage0/src/secauth.rs), so the UKI is netboot-only — it needs no
+# check (github.com/lockboot/stage0, crates/stage0/src/secauth.rs), so the UKI is netboot-only — it needs no
 # disk image, efi-vars, or db signature (those belong to the stage0 release).
 # stage0 is the ONLY db/Authenticode-signed link in the chain: the UKI is admitted
 # by the sha256 pinned in _stage1 (or an ed25519 .sig) plus the PCR 14 measurement,

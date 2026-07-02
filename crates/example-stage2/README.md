@@ -193,5 +193,5 @@ at your option.
 ## See Also
 
 - [stage1](../stage1/) - The secure boot loader that executes this binary
-- [rawdogtpm2](../rawdogtpm2/) - TPM 2.0 library used for attestation
+- [vaportpm](https://github.com/lockboot/vaportpm) - TPM 2.0 library used for attestation
 - [Root README](../../README.md) - Full project documentation
