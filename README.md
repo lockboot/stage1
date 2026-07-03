@@ -1,69 +1,61 @@
-# 🔒🌩️ LockBoot
+# 🔒 stage1 — the Lock.Boot netboot UKI
 
-A secure two-stage boot system using the TPM (and AWS Nitro, if available) for verifiable system initialization. It provides a minimal UEFI linux image which downloads and performs a TPM-based verified execution:
+Part of [Lock.Boot](https://github.com/lockboot) — see the org page for the whole boot chain. **stage1** is the netboot **UKI**: a Unified Kernel Image (Linux kernel + minimal initramfs + the `stage1` bootloader as PID 1) that [stage0](https://github.com/lockboot/stage0) fetches over the network, verifies, measures into PCR 14, and chain-loads.
 
-- **Multi-Cloud**: Automatic configuration from AWS/GCP/Azure metadata (IMDSv2)
-- **Verified Boot**: SHA256 validation with TPM PCR measurements (PCR 14: binary, PCR 15: config)
-- **Attestation**: Pre-execution TPM attestation documents for remote verification
-- **Multi-Architecture**: Native support for x86_64 and aarch64
-- **Secure Boot**: UEFI Secure Boot signed and locked (DeployedMode=1)
+Once running, `stage1` reads a `_stage2` manifest from cloud metadata (IMDSv2), downloads the stage2 payload, verifies it by `sha256`, extends a TPM PCR, generates an attestation document, and `exec`s it as PID 1.
 
-## Quick Start
-
-This repo builds the netboot **UKI** (`linux.efi`) that [stage0](https://github.com/lockboot/stage0) fetches, verifies, measures into PCR 14, and chain-loads. Build it with:
+## Build
 
 ```bash
-make x86_64            # -> tools/build-uki/x86_64/linux.efi
+make x86_64            # -> tools/build-uki/x86_64/linux.efi   (the UKI)
+make aarch64
+make stage2-x86_64     # -> build/x86_64/stage2                (the example leaf)
 ```
 
-To exercise the whole chain under QEMU (stage0 → UKI → stage1 → example-stage2), stage0 is the harness — build its boot disk in the sibling repo, then run the chain test (borrows `../stage0/build/<arch>/boot.disk` and the shared `lockboot:harness` image):
+Everything compiles inside the shared `lockboot:build` image (built from [stage0](https://github.com/lockboot/stage0)'s canonical `Dockerfile.build`); no host toolchain is needed. `vaportpm` is pulled from git, so the repo builds standalone — no sibling checkout required.
+
+## Test the whole chain
+
+`stage0 → UKI → stage1 → example-stage2`, under QEMU + KVM. stage0 is the harness: build its boot disk in the sibling repo, then run the chain test — it borrows `../stage0/build/<arch>/boot.disk` and the shared `lockboot:harness` image, serves the UKI + leaf + a signed/pinned manifest, and boots it:
 
 ```bash
-(cd ../stage0 && make build-x86_64)   # the external stage0 boot apparatus
-make test-chain-x86_64                # sha256 admission (default)
-make test-chain-x86_64 SIGN=1         # ed25519 signed-manifest admission
+(cd ../stage0 && make build-x86_64)
+make test-chain-x86_64            # sha256 admission (default)
+make test-chain-x86_64 SIGN=1     # ed25519 signed-manifest admission
 ```
 
-## Configuration Format
+## stage2 manifest (`_stage2`)
+
+stage1 admits its payload from a `_stage2` block in the instance's user-data:
 
 ```json
 {
   "_stage2": {
-    "x86_64": {
-      "url": "https://example.com/stage2-amd64",
-      "sha256": "abc123..."
-    },
-    "aarch64": {
-      "url": "https://example.com/stage2-arm64",
-      "sha256": "def456..."
-    },
+    "x86_64":  { "url": "https://example.com/stage2-amd64", "sha256": "abc123..." },
+    "aarch64": { "url": "https://example.com/stage2-arm64", "sha256": "def456..." },
     "args": ["--flag", "value"]
   }
 }
 ```
 
-You can run any statically linked Linux ELF, but the minimal filesystem only has `/bin/{busybox,bwrap,stage1}` and `/tmp`
+Any statically-linked Linux ELF works; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
 
-## Components
+## Publish the UKI
 
-- **[stage0](https://github.com/lockboot/stage0)**: Kernel-less UEFI netboot loader (downloads + measures + chain-loads a UEFI payload) — its own repo; this repo's UKI is the payload it netboots
-- **[stage1](crates/stage1/README.md)**: Secure bootloader (fetches config, verifies binaries, extends PCRs)
-- **[example-stage2](crates/example-stage2/README.md)**: Example user application
-- **[vaportpm](https://github.com/lockboot/vaportpm)**: TPM 2.0 attestation library (external dependency)
-
-## Cloud Deployment
-
-Two independent artifacts are published on two tracks:
-
-- **The bootable cloud image (the stage0 Secure Boot root)** is built and published from the [stage0 repo](https://github.com/lockboot/stage0) (its `tools/publish/` bakes the AMI/GCP image from the `stage0-v*` release). That is the firmware-admitted root of trust and is not this repo's concern.
-- **The netboot UKI (this repo)** is just a file served over HTTP(S): stage0 downloads it, verifies the pinned `sha256` (or `ed25519` signature), measures it into PCR 14, and chain-loads it. Publish it and print the matching `_stage1` block with:
+The UKI is served over HTTP(S) for stage0 to fetch. Upload it and print the matching `_stage1` block (the doc stage0 uses to admit the UKI):
 
 ```bash
 tools/publish.sh s3://bucket/prefix x86_64 local   # or gs://bucket/prefix
 ```
 
-The instance's user-data carries the `_stage1` doc pointing at wherever you uploaded `linux.efi` (see [Configuration Format](#configuration-format)).
+The bootable cloud image — the stage0 Secure Boot root — is published from the [stage0 repo](https://github.com/lockboot/stage0), not here.
+
+## Crates
+
+- **`stage1`** — the PID-1 bootloader baked into the UKI.
+- **`mkuki`** — reproducible UKI assembler (kernel + gzip'd cpio layers → PE, optional `ed25519` signature); a build-host tool.
+- **`example-stage2`** — a minimal example leaf payload; copy it as a template for your own stage2.
 
 ## License
 
-Licensed under Apache 2.0 or MIT at your option.
+Apache-2.0 OR MIT, at your option.
