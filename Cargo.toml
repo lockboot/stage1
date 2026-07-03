@@ -13,6 +13,9 @@ sha2 = "0.10"
 anyhow = "1.0"
 hex = "0.4"
 libc = "0.2"
+# ed25519 verification for signed-mode payloads (verify-only). Same crate stage0/mkuki
+# use — the detached .sig is a cross-repo wire contract.
+ed25519-compact = { version = "2", default-features = false }
 
 vaportpm-attest = { git = "https://github.com/lockboot/vaportpm" }
 

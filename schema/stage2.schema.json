@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lockboot/stage1/schema/stage2.schema.json",
+  "title": "Lock.Boot _stage2 metadata",
+  "description": "The `_stage2` block of a Lock.Boot instance's user-data: how stage1 admits and runs the stage2 payload. stage1 reads only `_stage2`; a full user-data document may also carry `_stage1` (stage0's UKI-admission format, specified separately and http-only). Runtime parsing ignores unknown keys; this schema is stricter to catch authoring mistakes.",
+  "type": "object",
+  "required": ["_stage2"],
+  "properties": {
+    "_stage2": { "$ref": "#/$defs/stage2Config" },
+    "_stage1": {
+      "type": "object",
+      "description": "stage0's UKI-admission config (separate schema, http-only, single url). Ignored by stage1."
+    }
+  },
+  "$defs": {
+    "stage2Config": {
+      "type": "object",
+      "description": "Per-architecture stage2 admission config, plus shared inline args.",
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Inline argv passed to stage2. Overridden by verified args_url in ed25519 mode."
+        },
+        "x86_64": { "$ref": "#/$defs/archConfig" },
+        "aarch64": { "$ref": "#/$defs/archConfig" }
+      },
+      "anyOf": [
+        { "required": ["x86_64"] },
+        { "required": ["aarch64"] }
+      ],
+      "additionalProperties": false
+    },
+    "url": {
+      "type": "string",
+      "description": "http(s):// URL, printable ASCII (no spaces or control characters).",
+      "pattern": "^https?://[!-~]+$"
+    },
+    "urlOrList": {
+      "description": "A single URL, or a non-empty fallback list tried in order.",
+      "oneOf": [
+        { "$ref": "#/$defs/url" },
+        { "type": "array", "items": { "$ref": "#/$defs/url" }, "minItems": 1 }
+      ]
+    },
+    "archConfig": {
+      "type": "object",
+      "description": "How stage1 admits the stage2 payload for one architecture. Exactly one of `sha256` (pin an exact payload) or `ed25519` (pin a release pubkey; payload rolls forward via a detached `.sig`). Every URL field accepts a string or a fallback list; `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder replaced with the payload's hex digest.",
+      "properties": {
+        "url": { "$ref": "#/$defs/urlOrList" },
+        "sha256": {
+          "type": "string",
+          "description": "Lowercase or uppercase hex SHA-256 of the payload.",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "ed25519": {
+          "type": "string",
+          "description": "Base64 (standard, padded) of a 32-byte ed25519 public key.",
+          "pattern": "^[A-Za-z0-9+/]{43}=$"
+        },
+        "sig_url": { "$ref": "#/$defs/urlOrList" },
+        "args_url": { "$ref": "#/$defs/urlOrList" },
+        "args_sig_url": { "$ref": "#/$defs/urlOrList" }
+      },
+      "required": ["url"],
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["sha256"], "not": { "required": ["ed25519"] } },
+        { "required": ["ed25519"], "not": { "required": ["sha256"] } }
+      ],
+      "allOf": [
+        {
+          "if": { "required": ["args_url"] },
+          "then": { "required": ["ed25519"] }
+        }
+      ],
+      "dependentRequired": {
+        "args_sig_url": ["args_url"]
+      }
+    }
+  },
+  "examples": [
+    {
+      "_stage2": {
+        "x86_64": { "url": "https://host/stage2-amd64", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+      }
+    },
+    {
+      "_stage2": {
+        "x86_64": {
+          "url": ["https://cdn1/stage2", "https://cdn2/stage2"],
+          "ed25519": "7UdK/khl49Mb0ADEENiSe/U8uXKX34koFYhdcTVyhpI=",
+          "sig_url": ["https://cdn1/sigs/{sha256}.sig", "https://cdn2/sigs/{sha256}.sig"],
+          "args_url": "https://cdn1/args.json"
+        }
+      }
+    }
+  ]
+}
