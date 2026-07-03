@@ -203,15 +203,30 @@ build/keys/release.pem: docker-build-base
 		openssl pkey -in build/keys/release.pem -pubout -outform DER \
 			| tail -c 32 | base64 -w0 > build/keys/release.pub.b64"
 
-# Detached ed25519 signature over the whole UKI (SIGN=1). Deterministic per RFC 8032,
-# so `openssl pkeyutl -rawin` yields the exact bytes stage0 verifies with the pinned
-# pubkey (same approach stage0 uses to sign its own test payload). Served as
-# linux.efi.sig; stage0 fetches <url>.sig when the manifest carries `ed25519`.
+# Detached ed25519 sigs over the UKI and stage2 (SIGN=1). ed25519 is deterministic, so
+# `openssl pkeyutl -rawin` yields the exact bytes stage0/stage1 verify against the pinned
+# pubkey. Served as <name>.sig; each verifier fetches <url>.sig in ed25519 mode.
 build/%/linux.efi.sig: tools/build-uki/%/linux.efi build/keys/release.pem
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
 		mkdir -p build/$* && \
 		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
 			-in tools/build-uki/$*/linux.efi -out build/$*/linux.efi.sig"
+
+build/%/stage2.sig: build/%/stage2 build/keys/release.pem
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		mkdir -p build/$* && \
+		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
+			-in build/$*/stage2 -out build/$*/stage2.sig"
+
+# Signed remote args for SIGN_ARGS=1: a JSON array of strings, ed25519-signed like the
+# payloads. stage1 fetches args.json + args.json.sig, verifies against the pinned key,
+# and uses them as argv (overriding inline _stage2.args).
+build/%/args.json.sig: build/keys/release.pem
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		mkdir -p build/$* && \
+		printf '%s' '[\"--from\",\"signed-args\"]' > build/$*/args.json && \
+		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
+			-in build/$*/args.json -out build/$*/args.json.sig"
 
 # Guard the arch-less form with a helpful message instead of "no rule to make target".
 .PHONY: test-chain
@@ -219,35 +234,54 @@ test-chain:
 	@echo "'$@' needs an arch suffix, e.g. 'make $@-x86_64' or 'make $@-aarch64'." >&2
 	@exit 2
 
-# Full-chain end-to-end test: stage0 -> UKI -> stage1 -> example-stage2, all served
-# from one local dir (no S3). A single served user-data carries `_stage1` (stage0
-# admits the UKI) and `_stage2` (stage1 admits the leaf by sha256); the two parsers
-# coexist on distinct keys. Hashes are computed from the local files so the doc can
-# never go stale. SIGN=1 additionally serves linux.efi.sig and pins the ed25519
-# pubkey for `_stage1` instead of a sha256.
-test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 $(if $(SIGN),build/%/linux.efi.sig)
+# Full-chain end-to-end test: stage0 -> UKI -> stage1 -> example-stage2, served from one
+# local dir. One served user-data carries `_stage1` (stage0 admits the UKI) and `_stage2`
+# (stage1 admits the leaf); the two parsers coexist on distinct keys. Hashes are computed
+# from the local files so the doc can't go stale. Modes:
+#   (default)    sha256 pins for both hops.
+#   SIGN=1       ed25519 for BOTH hops: serve linux.efi.sig + stage2.sig, pin the release
+#                pubkey in _stage1 and _stage2 (payloads roll forward under a stable key).
+#   SIGN_ARGS=1  (implies SIGN) also serve signed args.json (+ .sig) and set _stage2.args_url,
+#                exercising stage1's signed-remote-args path.
+#   FALLBACK=1   make the _stage2 url a list [dead 127.0.0.1:9, real] so stage1's mirror
+#                fallback is exercised (the first url refuses, the second serves).
+test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
+		$(if $(SIGN),build/%/linux.efi.sig build/%/stage2.sig) \
+		$(if $(SIGN_ARGS),build/%/args.json.sig)
 	@if [ ! -f "$(STAGE0_BOOT_DISK)" ]; then \
 		echo "Missing external stage0 boot disk: $(STAGE0_BOOT_DISK)" >&2; \
 		echo "Build it first:  (cd $(STAGE0_DIR) && make build-$*)" >&2; \
 		echo "or set STAGE0_BOOT_DISK=<path> to one unpacked from a stage0 release." >&2; \
 		exit 1; \
 	fi
-	@D="build/$*/chain"; rm -rf "$$D"; mkdir -p "$$D"; \
+	@D="build/$*/chain"; rm -rf "$$D"; mkdir -p "$$D"; H="http://$(SERVE_HOST)"; \
 	cp tools/build-uki/$*/linux.efi "$$D/linux.efi"; \
 	cp build/$*/stage2 "$$D/stage2"; \
-	S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+	S2URL="\"$$H/stage2\""; \
+	if [ -n "$(FALLBACK)" ]; then S2URL="[ \"http://127.0.0.1:9/stage2\", \"$$H/stage2\" ]"; echo "fallback: stage2 url = [dead 127.0.0.1:9, $$H/stage2]"; fi; \
 	if [ -n "$(SIGN)" ]; then \
 		cp build/$*/linux.efi.sig "$$D/linux.efi.sig"; \
+		cp build/$*/stage2.sig "$$D/stage2.sig"; \
 		PUB=$$(cat build/keys/release.pub.b64); \
-		printf '{\n  "_stage1": { "%s": { "url": "http://%s/linux.efi", "ed25519": "%s" } },\n  "_stage2": { "%s": { "url": "http://%s/stage2", "sha256": "%s" } }\n}\n' \
-			"$*" "$(SERVE_HOST)" "$$PUB" "$*" "$(SERVE_HOST)" "$$S2_SHA" > user-data.stage0.json; \
-		echo "Wrote user-data.stage0.json (signed UKI, pubkey $$PUB; stage2 sha256 $$S2_SHA)"; \
+		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"ed25519\": \"$$PUB\" }"; \
+		S2="\"$*\": { \"url\": $$S2URL, \"ed25519\": \"$$PUB\""; \
+		if [ -n "$(SIGN_ARGS)" ]; then \
+			cp build/$*/args.json "$$D/args.json"; \
+			cp build/$*/args.json.sig "$$D/args.json.sig"; \
+			S2="$$S2, \"args_url\": \"$$H/args.json\""; \
+			echo "user-data: signed mode + signed args (pubkey $$PUB)"; \
+		else \
+			echo "user-data: signed mode (pubkey $$PUB)"; \
+		fi; \
+		S2="$$S2 }"; \
 	else \
 		UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
-		printf '{\n  "_stage1": { "%s": { "url": "http://%s/linux.efi", "sha256": "%s" } },\n  "_stage2": { "%s": { "url": "http://%s/stage2", "sha256": "%s" } }\n}\n' \
-			"$*" "$(SERVE_HOST)" "$$UKI_SHA" "$*" "$(SERVE_HOST)" "$$S2_SHA" > user-data.stage0.json; \
-		echo "Wrote user-data.stage0.json (chain: UKI sha256 $$UKI_SHA, stage2 sha256 $$S2_SHA)"; \
+		S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"sha256\": \"$$UKI_SHA\" }"; \
+		S2="\"$*\": { \"url\": $$S2URL, \"sha256\": \"$$S2_SHA\" }"; \
+		echo "user-data: sha256 mode (UKI $$UKI_SHA, stage2 $$S2_SHA)"; \
 	fi; \
+	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s }\n}\n' "$$S1" "$$S2" > user-data.stage0.json; \
 	$(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \

@@ -2,7 +2,7 @@
 
 Part of [Lock.Boot](https://github.com/lockboot) — see the org page for the whole boot chain. **stage1** is the netboot **UKI**: a Unified Kernel Image (Linux kernel + minimal initramfs + the `stage1` bootloader as PID 1) that [stage0](https://github.com/lockboot/stage0) fetches over the network, verifies, measures into PCR 14, and chain-loads.
 
-Once running, `stage1` reads a `_stage2` manifest from cloud metadata (IMDSv2), downloads the stage2 payload, verifies it by `sha256`, extends a TPM PCR, generates an attestation document, and `exec`s it as PID 1.
+Once running, `stage1` reads a `_stage2` manifest from cloud metadata (IMDSv2), downloads the stage2 payload, **admits it by a pinned `sha256` or an `ed25519` signature**, extends **PCR 14 with the payload hash** (loaded code only — never config), generates an attestation, and `exec`s it as PID 1.
 
 ## Build
 
@@ -26,17 +26,51 @@ make test-chain-x86_64 SIGN=1     # ed25519 signed-manifest admission
 
 ## stage2 manifest (`_stage2`)
 
-stage1 admits its payload from a `_stage2` block in the instance's user-data:
+stage1 admits its stage2 payload from a `_stage2` block in the instance's user-data, per architecture. Choose **one** admission mode per entry.
+
+**sha256** — pin an exact payload:
 
 ```json
 {
   "_stage2": {
-    "x86_64":  { "url": "https://example.com/stage2-amd64", "sha256": "abc123..." },
-    "aarch64": { "url": "https://example.com/stage2-arm64", "sha256": "def456..." },
+    "x86_64":  { "url": "https://host/stage2-amd64", "sha256": "abc123..." },
+    "aarch64": { "url": "https://host/stage2-arm64", "sha256": "def456..." },
     "args": ["--flag", "value"]
   }
 }
 ```
+
+**ed25519** — pin a long-term release **public key** (base64 of 32 bytes). The payload can then roll forward with **no reconfiguration**: re-sign it, push it, reboot. stage1 fetches a detached signature at `<url>.sig` (override with `sig_url`; `{sha256}` is substituted) and verifies it against the pinned key:
+
+```json
+{
+  "_stage2": {
+    "x86_64": {
+      "url": "https://host/stage2-amd64",
+      "ed25519": "BASE64_32BYTE_PUBKEY",
+      "args_url": "https://host/args.json"
+    }
+  }
+}
+```
+
+`args_url` (ed25519 mode only) fetches a **signed** JSON array of strings — verified against the same key via `<args_url>.sig` (or an explicit `args_sig_url`) — that **overrides** inline `args`. Generate configs with `stage1 --make-config <ARCH> <URL>` (sha256) or `stage1 --make-config-ed25519 <ARCH> <URL> <PUBKEY_B64>`; sign payloads with `openssl pkeyutl -sign -rawin` (the same key format `mkuki` uses, wire-compatible with stage0).
+
+**Fallback URLs.** Every URL field (`url`, `sig_url`, `args_url`, `args_sig_url`) accepts either a single string **or a list of strings** tried in order — for mirror resiliency. Because the payload is cryptographically pinned, any mirror that yields verifying bytes is accepted; a dead or wrong mirror is simply skipped. URLs may be `http://` or `https://`, and `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder (replaced with the payload's hex digest, for content-addressed signatures):
+
+```json
+{
+  "_stage2": {
+    "x86_64": {
+      "url": ["https://cdn1/stage2", "https://cdn2/stage2"],
+      "ed25519": "BASE64_32BYTE_PUBKEY",
+      "sig_url": ["https://cdn1/sigs/{sha256}.sig", "https://cdn2/sigs/{sha256}.sig"]
+    }
+  }
+}
+```
+
+**Measurement is code-only.** stage1 extends **PCR 14** with the SHA-256 of the stage2 binary and nothing else — the admission pin / key / signature and the config JSON are *not* measured. This keeps the platform quote reproducible from the boot artifacts alone (stage0 → UKI → app), and leaves a stage2 app free to measure whatever config *it* deems trust-relevant (PCR 15 is left untouched for it).
 
 Any statically-linked Linux ELF works; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
 
