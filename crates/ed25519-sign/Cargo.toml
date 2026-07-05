@@ -1,0 +1,11 @@
+[package]
+name = "ed25519-sign"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+ed25519-compact = { workspace = true }
+sha2 = { workspace = true }

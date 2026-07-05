@@ -1,0 +1,14 @@
+[package]
+name = "metadata"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Lock.Boot _stage1/_stage2 admission metadata: the wire types + validation, shared by the stage1 verifier and the deploy tool."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+ed25519-compact = { workspace = true }

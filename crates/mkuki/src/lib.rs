@@ -18,8 +18,11 @@
 //! one in `main.rs`.
 
 pub mod cpio;
-pub mod sign;
 pub mod uki;
+
+// The ed25519 signer lives in a shared crate (used by the deploy tool too); re-export
+// it as `sign` so existing `mkuki::sign::…` / `crate::sign::…` paths keep working.
+pub use ed25519_sign as sign;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
