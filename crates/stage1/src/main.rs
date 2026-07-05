@@ -9,11 +9,11 @@ use rustls::crypto::CryptoProvider;
 use sha2::{Digest, Sha256};
 use vaportpm_attest::{PcrOps, Tpm};
 use vaportpm_attest as tpm;
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -409,22 +409,100 @@ fn verify_checksum(data: &[u8], expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
+// Linux 6.3+: ask for an executable memfd explicitly (hardened kernels default new
+// memfds to non-executable). Older kernels reject the flag with EINVAL, so we retry
+// without it. Kept local because older libc releases don't export the constant.
+const MFD_EXEC: libc::c_uint = 0x0010;
+
+/// Stage bytes into an anonymous in-memory file (never a named path). When `seal`, the
+/// contents are made immutable (F_SEAL_WRITE) so they cannot change after this returns;
+/// when `exec`, the file is created executable.
+fn make_memfd(name: &str, data: &[u8], seal: bool, exec: bool) -> Result<OwnedFd> {
+    let cname = CString::new(name).expect("memfd name has no interior NUL");
+    let base: libc::c_uint = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    let mut raw = unsafe { libc::memfd_create(cname.as_ptr(), base | if exec { MFD_EXEC } else { 0 }) };
+    if raw < 0 && exec && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // Pre-6.3 kernel: no MFD_EXEC. New memfds are executable by default there.
+        raw = unsafe { libc::memfd_create(cname.as_ptr(), base) };
+    }
+    if raw < 0 {
+        return Err(io::Error::last_os_error()).context("memfd_create");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let mut rest = data;
+    while !rest.is_empty() {
+        let n = unsafe {
+            libc::write(fd.as_raw_fd(), rest.as_ptr() as *const libc::c_void, rest.len())
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error()).context("write to memfd");
+        }
+        rest = &rest[n as usize..];
+    }
+
+    if seal {
+        // No writable mmap is outstanding (we only wrote via write(2)), so F_SEAL_WRITE
+        // takes. SHRINK/GROW/SEAL lock the size and the seal set itself.
+        let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(io::Error::last_os_error()).context("F_ADD_SEALS on payload");
+        }
+    }
+    Ok(fd)
+}
+
+/// Build a NULL-terminated C array from owned CStrings (the CStrings must outlive it).
+fn null_terminated(v: &[CString]) -> Vec<*const libc::c_char> {
+    v.iter().map(|c| c.as_ptr()).chain(std::iter::once(std::ptr::null())).collect()
+}
+
+/// Exec the stage2 payload from a sealed, anonymous memfd (nothing on any named path):
+/// the bytes measured into PCR 14 are sealed immutable and are exactly what runs. Config
+/// (the raw user-data JSON) is delivered on stdin from a second memfd -- a universal
+/// channel that needs no extra-fd convention (which trips up runtimes like Bun/Node
+/// single-file executables) and, being an in-memory file, has no pipe-size limit.
 fn execute_binary(data: &[u8], args: &[String], json_config: &[u8]) -> Result<()> {
-    let tmp_path = format!("{}/stage2.exe", TMP_DIR);
-    fs::write(&tmp_path, data).context(format!("Failed to write binary to {}", tmp_path))?;
+    let exe = make_memfd("stage2", data, /*seal=*/ true, /*exec=*/ true)?;
 
-    // Make the binary executable
-    let mut perms = fs::metadata(&tmp_path)
-        .context("Failed to get file metadata")?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&tmp_path, perms).context("Failed to set executable permissions")?;
+    let cfg = make_memfd("stage2-config", json_config, false, false)?;
+    if unsafe { libc::lseek(cfg.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(io::Error::last_os_error()).context("rewind config memfd");
+    }
+    if unsafe { libc::dup2(cfg.as_raw_fd(), 0) } < 0 {
+        return Err(io::Error::last_os_error()).context("wire config memfd to stdin");
+    }
 
-    let json_path = format!("{}/stage2-config.json", TMP_DIR);
-    fs::write(&json_path, json_config).context(format!("Failed to write config to {}", json_path))?;
+    // argv[0] = "stage2", then the (signed or inline) args; envp = inherited environment.
+    let argv_owned: Vec<CString> = std::iter::once("stage2".to_string())
+        .chain(args.iter().cloned())
+        .map(|s| CString::new(s).map_err(|_| anyhow!("stage2 argument has an interior NUL")))
+        .collect::<Result<_>>()?;
+    let envp_owned: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut kv = k;
+            kv.push("=");
+            kv.push(v);
+            CString::new(kv.into_vec()).ok()
+        })
+        .collect();
+    let argv = null_terminated(&argv_owned);
+    let envp = null_terminated(&envp_owned);
+    let empty = CString::new("").unwrap();
 
-    ktseprintln!("{}: {:?}\n", tmp_path, args);
+    ktseprintln!("exec stage2 (sealed memfd, config on stdin): {:?}", args);
 
-    let err = Command::new(&tmp_path).args(args).exec();
-    Err(anyhow!("Failed to exec binary: {}", err))
+    // execveat(fd, "", ..., AT_EMPTY_PATH) execs the fd directly -- no /proc dependency,
+    // unlike glibc's fexecve fallback. Only returns on failure.
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            exe.as_raw_fd(),
+            empty.as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        );
+    }
+    Err(anyhow!("execveat stage2 failed: {}", io::Error::last_os_error()))
 }

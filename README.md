@@ -2,7 +2,7 @@
 
 Part of [Lock.Boot](https://github.com/lockboot) — see the org page for the whole boot chain. **stage1** is the netboot **UKI**: a Unified Kernel Image (Linux kernel + minimal initramfs + the `stage1` bootloader as PID 1) that [stage0](https://github.com/lockboot/stage0) fetches over the network, verifies, measures into PCR 14, and chain-loads.
 
-Once running, `stage1` reads a `_stage2` manifest from cloud metadata (IMDSv2), downloads the stage2 payload, **admits it by a pinned `sha256` or an `ed25519` signature**, extends **PCR 14 with the payload hash** (loaded code only — never config), generates an attestation, and `exec`s it as PID 1.
+Once running, `stage1` reads a `_stage2` manifest from cloud metadata (IMDSv2), downloads the stage2 payload, **admits it by a pinned `sha256` or an `ed25519` signature**, extends **PCR 14 with the payload hash** (loaded code only — never config), generates an attestation, and `exec`s it as PID 1 from a sealed in-memory image (never a file on disk).
 
 ## Build
 
@@ -72,7 +72,9 @@ stage1 admits its stage2 payload from a `_stage2` block in the instance's user-d
 
 **Measurement is code-only.** stage1 extends **PCR 14** with the SHA-256 of the stage2 binary and nothing else — the admission pin / key / signature and the config JSON are *not* measured. This keeps the platform quote reproducible from the boot artifacts alone (stage0 → UKI → app), and leaves a stage2 app free to measure whatever config *it* deems trust-relevant (PCR 15 is left untouched for it).
 
-Any statically-linked Linux ELF works; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
+**Execution is pathless.** stage1 loads the payload into a sealed `memfd` (`F_SEAL_WRITE`) and `execveat`s it directly, so the bytes measured into PCR 14 are immutable and are exactly what runs — nothing is written to a named path where it could be swapped between measurement and exec. The payload receives the raw user-data JSON on **stdin** (a second in-memory file, so any runtime that reads stdin works — no extra-fd convention that would trip up Bun/Node single-file executables), and the pre-exec attestation at `/tmp/stage1.attest`.
+
+Any statically-linked Linux ELF works, as long as it reads its config from stdin; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
 
 ## Deploy
 

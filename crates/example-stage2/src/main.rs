@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::thread;
 use std::time::Duration;
 
@@ -14,11 +15,12 @@ fn main() {
     }
     println!();
 
-    // Print stage2-config.json
-    println!("=== /tmp/stage2-config.json ===");
-    match fs::read_to_string("/tmp/stage2-config.json") {
-        Ok(contents) => println!("{}", contents),
-        Err(e) => eprintln!("Error reading /tmp/stage2-config.json: {}", e),
+    // stage1 delivers the config (the raw user-data JSON) on stdin.
+    println!("=== config (stdin) ===");
+    let mut config = String::new();
+    match std::io::stdin().read_to_string(&mut config) {
+        Ok(_) => println!("{}", config),
+        Err(e) => eprintln!("Error reading config from stdin: {}", e),
     }
     println!();
 
