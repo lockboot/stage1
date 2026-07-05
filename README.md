@@ -54,7 +54,7 @@ stage1 admits its stage2 payload from a `_stage2` block in the instance's user-d
 }
 ```
 
-`args_url` (ed25519 mode only) fetches a **signed** JSON array of strings — verified against the same key via `<args_url>.sig` (or an explicit `args_sig_url`) — that **overrides** inline `args`. Generate configs with `stage1 --make-config <ARCH> <URL>` (sha256) or `stage1 --make-config-ed25519 <ARCH> <URL> <PUBKEY_B64>`; sign payloads with `openssl pkeyutl -sign -rawin` (the same key format `mkuki` uses, wire-compatible with stage0).
+`args_url` (ed25519 mode only) fetches a **signed** JSON array of strings — verified against the same key via `<args_url>.sig` (or an explicit `args_sig_url`) — that **overrides** inline `args`. You don't hand-write these docs: the [`deploy` tool](#deploy) below signs the payloads and generates the `user-data.json`.
 
 **Fallback URLs.** Every URL field (`url`, `sig_url`, `args_url`, `args_sig_url`) accepts either a single string **or a list of strings** tried in order — for mirror resiliency. Because the payload is cryptographically pinned, any mirror that yields verifying bytes is accepted; a dead or wrong mirror is simply skipped. URLs may be `http://` or `https://`, and `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder (replaced with the payload's hex digest, for content-addressed signatures):
 
@@ -74,20 +74,29 @@ stage1 admits its stage2 payload from a `_stage2` block in the instance's user-d
 
 Any statically-linked Linux ELF works; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
 
-## Publish the UKI
+## Deploy
 
-The UKI is served over HTTP(S) for stage0 to fetch. Upload it and print the matching `_stage1` block (the doc stage0 uses to admit the UKI):
+The **`deploy`** tool (binary `lockboot-deploy`) turns local build artifacts into an upload-ready deployment: it signs (or hashes) the UKI + stage2, composes **mirror URL lists** from repeated `--base-url`, and emits a directory plus a merged `user-data.json` carrying both `_stage1` (the UKI hop) and `_stage2` (the payload hop).
 
 ```bash
-tools/publish.sh s3://bucket/prefix x86_64 local   # or gs://bucket/prefix
+lockboot-deploy create --arch x86_64 \
+  --uki tools/build-uki/x86_64/linux.efi --stage2 build/x86_64/stage2 \
+  --key release.pem \                          # ed25519 signed mode (omit for sha256 pins)
+  --base-url http://cdn1 --base-url http://cdn2 \
+  --out ./deploy
+lockboot-deploy validate ./deploy              # check against the admission rules
+lockboot-deploy modify ./deploy --add-base-url http://cdn3   # add / --remove-base-url a mirror
 ```
 
-The bootable cloud image — the stage0 Secure Boot root — is published from the [stage0 repo](https://github.com/lockboot/stage0), not here.
+`create` writes `deploy/<arch>/{linux.efi,stage2}` (+ `.sig` in signed mode) and merges `deploy/user-data.json`; sync the directory to each mirror and pass `user-data.json` as the instance's user-data. It shares the `metadata` types with the stage1 verifier, so what it emits is exactly what stage0/stage1 accept. (`tools/publish.sh` remains as a simpler UKI-only uploader; the bootable cloud image — the stage0 Secure Boot root — is published from the [stage0 repo](https://github.com/lockboot/stage0).)
 
 ## Crates
 
-- **`stage1`** — the PID-1 bootloader baked into the UKI.
+- **`stage1`** — the on-instance PID-1 bootloader baked into the UKI (verify-only: admit → measure → exec).
+- **`metadata`** — the `_stage1`/`_stage2` wire types + `validate()`, shared by the stage1 verifier and the deploy emitter (one source of truth, no drift).
+- **`ed25519-sign`** — the ed25519 sign/verify + sha256 primitive (the cross-repo wire contract), used by `mkuki`, `deploy`, and `stage1`.
 - **`mkuki`** — reproducible UKI assembler (kernel + gzip'd cpio layers → PE, optional `ed25519` signature); a build-host tool.
+- **`deploy`** — the deployment tool above (`lockboot-deploy`); a build-host tool.
 - **`example-stage2`** — a minimal example leaf payload; copy it as a template for your own stage2.
 
 ## License

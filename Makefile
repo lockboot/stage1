@@ -128,13 +128,13 @@ tools/build-uki/%/linux.efi: tools/build-uki/%/busybox tools/build-uki/%/stage1 
 
 # Build AND extract stage1 inside the one container step, so the cp runs where
 # target/ exists rather than in the host/make context, which may not see the build
-# container's target dir under nested docker (e.g. `act`). --exclude mkuki: it is a
-# build-host tool, built separately for x86_64 by the tools/build-uki/mkuki rule, so
-# it must not be cross-compiled for $* here.
+# container's target dir under nested docker (e.g. `act`). --exclude mkuki/deploy: they
+# are build-host tools (mkuki assembles the UKI; deploy generates deployment config), so
+# they must not be cross-compiled for the payload target $* here.
 tools/build-uki/%/stage1: docker-build-base
 	mkdir -p tools/build-uki/$*
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --workspace --exclude mkuki --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
+		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --workspace --exclude mkuki --exclude deploy --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
 
 # mkuki assembles the UKI from inside build.sh. Unlike stage1 (which runs on the
 # target arch), mkuki is a build-host tool that runs in the x86_64 build container

@@ -1,0 +1,17 @@
+[package]
+name = "deploy"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Lock.Boot deploy tool: sign payloads, compose mirror URLs, and emit the _stage1/_stage2 user-data + an upload-ready directory."
+
+[[bin]]
+name = "lockboot-deploy"
+path = "src/main.rs"
+
+[dependencies]
+metadata = { path = "../metadata" }
+ed25519-sign = { path = "../ed25519-sign" }
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

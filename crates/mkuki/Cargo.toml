@@ -23,10 +23,8 @@ tar = "0.4"
 walkdir = "2"
 sha2 = "0.10"
 base64 = "0.22"
-# Same ed25519 implementation stage0 verifies with (github.com/lockboot/stage0,
-# crates/stage0/src/sig.rs), so a signature this tool emits is exactly what
-# stage0's admission check expects.
-ed25519-compact = "2.3"
+# The ed25519 signer (wire-compatible with stage0/stage1), re-exported as `mkuki::sign`.
+ed25519-sign = { path = "../ed25519-sign" }
 # Structured, multi-level logging. The library only *emits* events; the binary
 # installs the subscriber (see main.rs) so importers control their own logging.
 tracing = "0.1"
