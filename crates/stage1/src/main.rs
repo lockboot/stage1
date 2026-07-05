@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use metadata::{Profile, UrlList, UserData, Verify};
 use reqwest::blocking::Client;
 use rustls::crypto::CryptoProvider;
@@ -27,6 +28,15 @@ const TMP_DIR: &str = "/tmp";
 const PCR_BINARY: u8 = 14;
 
 fn main() {
+    // Single failure path: any error OR panic converges on `poweroff()`. As PID 1 an
+    // unhandled panic aborts into a kernel panic and skips the log-drain wait; route it
+    // through the same shutdown so it fails closed and its logs reach the serial console.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("stage1: PANIC: {info}");
+        let _ = io::stderr().flush();
+        poweroff();
+    }));
+
     let result = main_inner();
 
     // Flush output before exiting (especially important when running as PID 1)
@@ -168,7 +178,7 @@ fn substitute(urls: &[String], hash: &str) -> Vec<String> {
 }
 
 /// Download the first URL that responds (fallback across mirrors for resiliency).
-fn download_first(urls: &[String]) -> Result<Vec<u8>> {
+fn download_first(urls: &[String]) -> Result<Bytes> {
     let mut last: Option<anyhow::Error> = None;
     for url in urls {
         match download_binary(url) {
@@ -207,7 +217,7 @@ fn fetch_signed_args(
 
 /// Try each payload URL until one downloads and admits (mirrors are safe — every
 /// candidate must still pass the same pin/signature).
-fn admit_payload(urls: &[String], mode: &Verify) -> Result<(Vec<u8>, Option<Vec<String>>)> {
+fn admit_payload(urls: &[String], mode: &Verify) -> Result<(Bytes, Option<Vec<String>>)> {
     let mut last: Option<anyhow::Error> = None;
     for url in urls {
         match admit_from(url, mode) {
@@ -222,7 +232,7 @@ fn admit_payload(urls: &[String], mode: &Verify) -> Result<(Vec<u8>, Option<Vec<
 }
 
 /// Download one payload candidate and run admission control (a GATE — never measured).
-fn admit_from(url: &str, mode: &Verify) -> Result<(Vec<u8>, Option<Vec<String>>)> {
+fn admit_from(url: &str, mode: &Verify) -> Result<(Bytes, Option<Vec<String>>)> {
     let binary = download_binary(url)?;
     let hash = hex::encode(sha256!(&binary));
     let mut signed_args = None;
@@ -373,8 +383,9 @@ fn read_from_file(path: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn download_binary(url: &str) -> Result<Vec<u8>> {
+fn download_binary(url: &str) -> Result<Bytes> {
     let client = http_client()?;
+    // reqwest already owns the body as `Bytes`; hand it back as-is (no extra copy).
     let binary_data = client
         .get(url)
         .send()
@@ -382,9 +393,8 @@ fn download_binary(url: &str) -> Result<Vec<u8>> {
         .error_for_status()
         .context("Server returned an error status")?
         .bytes()
-        .context("Failed to read binary data")?
-        .to_vec();
-    log_hash(url, binary_data.as_slice());
+        .context("Failed to read binary data")?;
+    log_hash(url, &binary_data);
     Ok(binary_data)
 }
 
