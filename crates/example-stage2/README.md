@@ -88,20 +88,13 @@ Launch an EC2 instance with the configuration in the user-data field. The `stage
 5. Generate a TPM attestation document
 6. Execute the stage2 binary (this example)
 
-### Option 2: Manual Testing with File
+### Option 2: Manual Testing (config on stdin)
 
 ```bash
-# Create a config file
-stage1 --make-config https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/example-stage2 > config.json
-
-# Execute with stage1
-sudo stage1 --file config.json
-```
-
-### Option 3: Manual Testing with URL
-
-```bash
-sudo stage1 --url https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.example.json
+# Generate user-data.json with the `deploy` tool (lockboot-deploy), then pipe it in:
+sudo stage1 < user-data.json
+# or
+curl -s https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.example.json | sudo stage1
 ```
 
 ## Expected Output

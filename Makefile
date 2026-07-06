@@ -243,6 +243,8 @@ test-chain:
 #                pubkey in _stage1 and _stage2 (payloads roll forward under a stable key).
 #   SIGN_ARGS=1  (implies SIGN) also serve signed args.json (+ .sig) and set _stage2.args_url,
 #                exercising stage1's signed-remote-args path.
+#   ARGS='[..]'  set inline _stage2.args to this JSON array (ignored when SIGN_ARGS is set,
+#                which supplies its own signed args). Used by the smoke-args-% target.
 #   FALLBACK=1   make the _stage2 url a list [dead 127.0.0.1:9, real] so stage1's mirror
 #                fallback is exercised (the first url refuses, the second serves).
 test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
@@ -281,12 +283,34 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 		S2="\"$*\": { \"url\": $$S2URL, \"sha256\": \"$$S2_SHA\" }"; \
 		echo "user-data: sha256 mode (UKI $$UKI_SHA, stage2 $$S2_SHA)"; \
 	fi; \
-	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s }\n}\n' "$$S1" "$$S2" > user-data.stage0.json; \
+	S2ARGS=""; \
+	if [ -n '$(ARGS)' ] && [ -z "$(SIGN_ARGS)" ]; then \
+		AJSON=$$(printf '%s' '$(ARGS)'); \
+		S2ARGS="\"args\": $$AJSON, "; \
+		echo "user-data: inline _stage2.args = $$AJSON"; \
+	fi; \
+	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s%s }\n}\n' "$$S1" "$$S2ARGS" "$$S2" > user-data.stage0.json; \
 	$(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \
 			--boot-disk "$(STAGE0_BOOT_DISK)" \
 			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace)
+
+# ---- Smoke test: _stage2 args actually reach the payload's argv ----
+# Boot the full chain with a known inline args array (one arg contains a space, to prove
+# it is a real argv vector and not shell word-splitting) and assert the payload echoed it.
+# The signed-remote-args path is covered separately by `test-chain-% SIGN=1 SIGN_ARGS=1`.
+.PHONY: smoke-args-%
+smoke-args-%:
+	@log="build/$*/smoke-args.log"; mkdir -p "build/$*"; \
+	$(MAKE) test-chain-$* ARGS='["--smoke","hello world"]' 2>&1 | tee "$$log"; \
+	echo "=== smoke-args assertion ==="; \
+	if grep -q 'arg\[1\]: --smoke' "$$log" && grep -q 'arg\[2\]: hello world' "$$log"; then \
+		echo "PASS: inline _stage2.args reached the payload argv (spaces preserved)"; \
+	else \
+		echo "FAIL: expected 'arg[1]: --smoke' and 'arg[2]: hello world' in the console output"; \
+		exit 1; \
+	fi
 
 
 #####################################################################
