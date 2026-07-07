@@ -48,62 +48,22 @@ Any additional fields in the JSON are preserved, the raw file is written to `/tm
 
 ## Usage Modes
 
-### 1. Production Mode (PID 1 / No Arguments)
+### 1. Production (PID 1 / no arguments)
 
-When running as PID 1 or without arguments, stage1 automatically fetches its JSON config from the cloud metadata service, uses the TPM to attest the instance state, then executes it.
+As PID 1 (or with no arguments), stage1 fetches its user-data JSON from the cloud metadata service, admits and measures the stage2 payload, attests the virgin state, then execs it. This is the normal boot path.
 
-### 2. Testing with Local File
+### 2. Config on stdin
 
-```bash
-stage1 --file config.json
-```
-
-Reads configuration from a local JSON file. Useful for testing before deploying to cloud.
-
-### 3. Testing with Remote URL
+A user-data document piped on stdin takes precedence over the metadata service - the Unix way, for local testing or bespoke delivery:
 
 ```bash
-stage1 --url https://example.com/config.json
+stage1 < user-data.json
+cat user-data.json | stage1
 ```
 
-Fetches configuration from a remote URL. The URL content is hashed and logged.
+stage1 only reads stdin when it is a pipe or a regular file, never the console, so PID 1 never blocks waiting for input. Deployment documents are produced by the separate `deploy` tool (`lockboot-deploy`), not by this binary.
 
-### 4. Generate Configuration
-
-```bash
-stage1 --make-config <aarch64|x86_64> <URL> [existing-config.json]
-```
-
-Downloads a binary, computes its SHA256 hash, and outputs a valid stage1 configuration with architecture-specific settings:
-
-**Example:**
-```bash
-# Generate config for x86_64 binary
-stage1 --make-config x86_64 https://example.com/stage2-x86_64
-
-# Output:
-{
-  "_stage2": {
-    "x86_64": {
-      "url": "https://example.com/stage2-x86_64",
-      "sha256": "a1b2c3d4e5f6..."
-    }
-  }
-}
-```
-
-**Building a multi-architecture config:**
-```bash
-# First architecture creates the config
-stage1 --make-config x86_64 https://example.com/stage2-amd64 > config.json
-
-# Second architecture adds to existing config
-stage1 --make-config aarch64 https://example.com/stage2-arm64 config.json > config.json
-```
-
-This allows you to use the same configuration file across different architectures - stage1 will automatically select the appropriate binary based on its build target.
-
-### 5. Generate TPM Attestation
+### 3. Generate TPM Attestation
 
 ```bash
 sudo stage1 --attest [challenge]
@@ -129,20 +89,13 @@ The optional `challenge` can be used as a signing mechanism or as proof-of-liven
 
 ## TPM Measurements
 
-It first creates the following files in `/tmp/`:
-
-| File | Content | Purpose |
-|------|---------|---------|
-| `/tmp/stage2.exe` | Downloaded binary | The stage2 executable (mode 0755) |
-| `/tmp/stage2-config.json` | Full JSON config | Configuration data for stage2 |
-| `/tmp/stage1.attest` | TPM attestation | Pre-execution attestation document |
-
-Before executing stage2, the TPM PCRs are extended with cryptographic measurements:
+Before executing stage2, stage1 extends exactly one PCR:
 
 | PCR | Purpose | Value Extended |
 |-----|---------|----------------|
-| **PCR 14** | Stage2 Binary | SHA256 hash of the downloaded binary |
-| **PCR 15** | Configuration | SHA256 hash of the entire JSON config |
+| **PCR 14** | Stage2 binary | SHA-256 of the stage2 code, and nothing else |
+
+Measurement is **code-only**: the config, the admission pin/key, and the argv are *not* measured, so the platform quote is reproducible from the boot artifacts alone. PCR 15 is deliberately left untouched for a stage2 app to measure whatever config *it* deems trust-relevant. The stage2 payload runs from a sealed in-memory image (never a file on disk); it receives the raw user-data JSON on **stdin**, and the pre-execution attestation is written to `/tmp/stage1.attest`.
 
 ## Attestation Trust Model
 
@@ -152,7 +105,7 @@ A restricted signing key can only sign digests that the TPM itself produces. Whe
 
 Without the restricted key constraint, the trust model collapses into tautology: stage2 could simply sign "I'm in virgin state" and the attestation would prove nothing.
 
-The attestation uses `H(H(binary) || H(config))` as the nonce - a hash of the binary hash concatenated with the config hash - binding the attestation to the specific intended workload. Once this virgin-state attestation exists, any future use of the same AK inherits this trust anchor. A verifier can reason: "this AK was attested in a clean PCR state with config X, therefore subsequent quotes from this AK come from a system that started from that trusted state."
+The attestation uses `H(binary)` as the nonce - the SHA-256 of the stage2 code - binding the attestation to the specific intended workload. Config is deliberately not bound, matching the code-only PCR 14 measurement. Once this virgin-state attestation exists, any future use of the same AK inherits this trust anchor. A verifier can reason: "this AK was attested in a clean PCR state before this exact binary ran, therefore subsequent quotes from this AK come from a system that started from that trusted state."
 
 The restricted signing constraint is imposed by cloud vTPMs (notably GCP), which limits the AK to operations like `TPM2_Quote`, `TPM2_Certify`, and `TPM2_CertifyCreation`. While this can feel limiting, it's precisely what makes the trust model sound.
 
@@ -243,18 +196,12 @@ aws s3 cp target/aarch64-unknown-linux-musl/release/example-stage2 \
   s3://mybucket/stage2-arm64
 ```
 
-### 3. Generate multi-architecture configuration
-```bash
-# Add x86_64 config
-stage1 --make-config x86_64 https://mybucket.s3.amazonaws.com/stage2-amd64 > config.json
-
-# Add aarch64 config to the same file
-stage1 --make-config aarch64 https://mybucket.s3.amazonaws.com/stage2-arm64 config.json > config.json
-```
+### 3. Generate the deployment document
+Use the `deploy` tool (`lockboot-deploy`) to hash (or sign) the payloads and emit a `user-data.json` carrying `_stage1` and `_stage2`; see the [repo README](../../README.md#deploy). stage1 does not generate config itself.
 
 ### 4. Test locally
 ```bash
-sudo stage1 --file config.json
+stage1 < user-data.json
 ```
 
 ### 5. Deploy to cloud

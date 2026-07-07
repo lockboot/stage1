@@ -76,6 +76,15 @@ stage1 admits its stage2 payload from a `_stage2` block in the instance's user-d
 
 Any statically-linked Linux ELF works, as long as it reads its config from stdin; the minimal rootfs provides `/bin/{busybox,stage1}` (plus `udhcpc.script`) and `/tmp`.
 
+## Arguments and config model
+
+Two distinct hops, don't conflate them:
+
+- **stage1's own config** comes from the cloud **metadata** service (the PID-1 boot path) or, when stage1 is run as a normal process, from a user-data doc **piped on stdin** (`stage1 < user-data.json`). There are no `--url`/`--file` flags — pipe it in. `--attest` remains for diagnostics.
+- **The stage2 app's argv** comes from **`_stage2.args`** (inline) or the signed `args_url` (which overrides inline); these are handed to the payload as `argv[1..]` (with `argv[0] = "stage2"`).
+
+Note on `_stage1.args`: that field belongs to **stage0**, which sets the booted EFI program's UEFI *LoadOptions* from it — the generic contract for any EFI stage1. For **this Linux UKI**, the kernel command line is baked into the signed, measured `.cmdline` and is authoritative: under Secure Boot the stub **ignores** LoadOptions, so `_stage1.args` cannot (and must not) alter the UKI cmdline. Configure a UKI-based stage1 through **`_stage2`**, not the kernel cmdline. See the [stage0 repo](https://github.com/lockboot/stage0) for the LoadOptions contract.
+
 ## Deploy
 
 The **`deploy`** tool (binary `lockboot-deploy`) turns local build artifacts into an upload-ready deployment: it signs (or hashes) the UKI + stage2, composes **mirror URL lists** from repeated `--base-url`, and emits a directory plus a merged `user-data.json` carrying both `_stage1` (the UKI hop) and `_stage2` (the payload hop).
