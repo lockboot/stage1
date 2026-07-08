@@ -382,6 +382,7 @@ name = "deploy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ed25519-sign",
  "metadata",

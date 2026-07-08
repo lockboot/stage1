@@ -2,26 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/lockboot/stage1/schema/stage2.schema.json",
   "title": "Lock.Boot _stage2 metadata",
-  "description": "The `_stage2` block of a Lock.Boot instance's user-data: how stage1 admits and runs the stage2 payload. stage1 reads only `_stage2`; a full user-data document may also carry `_stage1` (stage0's UKI-admission format, specified separately and http-only). Runtime parsing ignores unknown keys; this schema is stricter to catch authoring mistakes.",
+  "description": "The `_stage2` block of a Lock.Boot instance's user-data: how stage1 admits and runs the stage2 payload. Each per-arch entry is a discriminated union -- exactly one of `payload` (admit a binary now) or `manifest` (fetch + verify a signed manifest, deep-merge it into the doc, and re-evaluate). stage1 reads only `_stage2`; a full user-data document may also carry `_stage1` (stage0's UKI-admission format, same shape, http-only). Runtime parsing ignores unknown keys; this schema is stricter to catch authoring mistakes.",
   "type": "object",
   "required": ["_stage2"],
   "properties": {
-    "_stage2": { "$ref": "#/$defs/stage2Config" },
+    "_stage2": { "$ref": "#/$defs/stageConfig" },
     "_stage1": {
       "type": "object",
-      "description": "stage0's UKI-admission config (separate schema, http-only, single url). Ignored by stage1."
+      "description": "stage0's UKI-admission config (same discriminated-union shape, http-only). Ignored by stage1."
     }
   },
   "$defs": {
-    "stage2Config": {
+    "stageConfig": {
       "type": "object",
-      "description": "Per-architecture stage2 admission config, plus shared inline args.",
+      "description": "Per-architecture admission config. The running arch's entry must be present.",
       "properties": {
-        "args": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Inline argv passed to stage2. Overridden by verified args_url in ed25519 mode."
-        },
         "x86_64": { "$ref": "#/$defs/archConfig" },
         "aarch64": { "$ref": "#/$defs/archConfig" }
       },
@@ -43,22 +38,47 @@
         { "type": "array", "items": { "$ref": "#/$defs/url" }, "minItems": 1 }
       ]
     },
+    "sha256": {
+      "type": "string",
+      "description": "Lowercase or uppercase hex SHA-256.",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "ed25519": {
+      "type": "string",
+      "description": "Base64 (standard, padded) of a 32-byte ed25519 public key.",
+      "pattern": "^[A-Za-z0-9+/]{43}=$"
+    },
     "archConfig": {
       "type": "object",
-      "description": "How stage1 admits the stage2 payload for one architecture. Exactly one of `sha256` (pin an exact payload) or `ed25519` (pin a release pubkey; payload rolls forward via a detached `.sig`). Every URL field accepts a string or a fallback list; `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder replaced with the payload's hex digest.",
+      "description": "Discriminated union for one architecture: exactly one of `payload` or `manifest`. `resolved_manifests` is verifier-written resolution provenance (operators do not author it).",
+      "properties": {
+        "payload": { "$ref": "#/$defs/payload" },
+        "manifest": { "$ref": "#/$defs/manifest" },
+        "resolved_manifests": {
+          "type": "array",
+          "description": "Resolution history stamped by stage1: one record per manifest hop, each carrying the fetched manifest's resolved `sha256`. Not authored by operators.",
+          "items": { "$ref": "#/$defs/manifest" }
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["payload"], "not": { "required": ["manifest"] } },
+        { "required": ["manifest"], "not": { "required": ["payload"] } }
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "description": "Admit a concrete binary. Exactly one of `sha256` (pin an exact payload) or `ed25519` (pin a release pubkey; the payload rolls forward via a detached `.sig`). Every URL field accepts a string or a fallback list; `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder replaced with the payload's hex digest.",
       "properties": {
         "url": { "$ref": "#/$defs/urlOrList" },
-        "sha256": {
-          "type": "string",
-          "description": "Lowercase or uppercase hex SHA-256 of the payload.",
-          "pattern": "^[0-9a-fA-F]{64}$"
-        },
-        "ed25519": {
-          "type": "string",
-          "description": "Base64 (standard, padded) of a 32-byte ed25519 public key.",
-          "pattern": "^[A-Za-z0-9+/]{43}=$"
-        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "ed25519": { "$ref": "#/$defs/ed25519" },
         "sig_url": { "$ref": "#/$defs/urlOrList" },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Inline argv passed to the payload. Overridden by verified args_url in ed25519 mode."
+        },
         "args_url": { "$ref": "#/$defs/urlOrList" },
         "args_sig_url": { "$ref": "#/$defs/urlOrList" }
       },
@@ -77,22 +97,41 @@
       "dependentRequired": {
         "args_sig_url": ["args_url"]
       }
+    },
+    "manifest": {
+      "type": "object",
+      "description": "Resolve a signed manifest (itself a `_stage2` user-data fragment). stage1 fetches it from `url`, verifies its detached signature (`sig_url`, else `<url>.sig`) against the pinned `ed25519` key, deep-merges the whole document into the doc at the top level, and re-evaluates the entry -- looping until it reaches a `payload`. Optional `sha256` pins the manifest's own bytes.",
+      "properties": {
+        "url": { "$ref": "#/$defs/urlOrList" },
+        "ed25519": { "$ref": "#/$defs/ed25519" },
+        "sig_url": { "$ref": "#/$defs/urlOrList" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["url", "ed25519"],
+      "additionalProperties": false
     }
   },
   "examples": [
     {
       "_stage2": {
-        "x86_64": { "url": "https://host/stage2-amd64", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }
+        "x86_64": { "payload": { "url": "https://host/stage2-amd64", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "args": ["--flag", "value"] } }
       }
     },
     {
       "_stage2": {
         "x86_64": {
-          "url": ["https://cdn1/stage2", "https://cdn2/stage2"],
-          "ed25519": "7UdK/khl49Mb0ADEENiSe/U8uXKX34koFYhdcTVyhpI=",
-          "sig_url": ["https://cdn1/sigs/{sha256}.sig", "https://cdn2/sigs/{sha256}.sig"],
-          "args_url": "https://cdn1/args.json"
+          "payload": {
+            "url": ["https://cdn1/stage2", "https://cdn2/stage2"],
+            "ed25519": "7UdK/khl49Mb0ADEENiSe/U8uXKX34koFYhdcTVyhpI=",
+            "sig_url": ["https://cdn1/sigs/{sha256}.sig", "https://cdn2/sigs/{sha256}.sig"],
+            "args_url": "https://cdn1/args.json"
+          }
         }
+      }
+    },
+    {
+      "_stage2": {
+        "x86_64": { "manifest": { "url": "https://host/stage2.manifest.json", "ed25519": "7UdK/khl49Mb0ADEENiSe/U8uXKX34koFYhdcTVyhpI=" } }
       }
     }
   ]

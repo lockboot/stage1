@@ -237,14 +237,19 @@ test-chain:
 # Full-chain end-to-end test: stage0 -> UKI -> stage1 -> example-stage2, served from one
 # local dir. One served user-data carries `_stage1` (stage0 admits the UKI) and `_stage2`
 # (stage1 admits the leaf); the two parsers coexist on distinct keys. Hashes are computed
-# from the local files so the doc can't go stale. Modes:
-#   (default)    sha256 pins for both hops.
+# from the local files so the doc can't go stale. Each arch entry is the discriminated union
+# `{ "payload": {…} }` (admit a binary) or `{ "manifest": {…} }` (resolve a signed manifest). Modes:
+#   (default)    sha256 pins for both hops (payload entries).
 #   SIGN=1       ed25519 for BOTH hops: serve linux.efi.sig + stage2.sig, pin the release
-#                pubkey in _stage1 and _stage2 (payloads roll forward under a stable key).
-#   SIGN_ARGS=1  (implies SIGN) also serve signed args.json (+ .sig) and set _stage2.args_url,
-#                exercising stage1's signed-remote-args path.
-#   ARGS='[..]'  set inline _stage2.args to this JSON array (ignored when SIGN_ARGS is set,
-#                which supplies its own signed args). Used by the smoke-args-% target.
+#                pubkey in the _stage1 / _stage2 payloads (roll forward under a stable key).
+#   SIGN_ARGS=1  (implies SIGN) also serve signed args.json (+ .sig) and set the _stage2 payload's
+#                args_url, exercising stage1's signed-remote-args path.
+#   MANIFEST=1   (with SIGN=1) resolve _stage2 through a signed manifest: build + sign a
+#                `{ "_stage2": { "<arch>": { "payload": {…} } } }` fragment, serve it, and pin
+#                `{ "manifest": { url, ed25519 } }` — exercising stage1's manifest resolution +
+#                top-level merge. Pair with ARGS (bound inside the manifest), not SIGN_ARGS.
+#   ARGS='[..]'  set the _stage2 payload's inline args to this JSON array (ignored when SIGN_ARGS
+#                is set, which supplies its own signed args). Used by the smoke-args-% target.
 #   FALLBACK=1   make the _stage2 url a list [dead 127.0.0.1:9, real] so stage1's mirror
 #                fallback is exercised (the first url refuses, the second serves).
 test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
@@ -261,35 +266,37 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 	cp build/$*/stage2 "$$D/stage2"; \
 	S2URL="\"$$H/stage2\""; \
 	if [ -n "$(FALLBACK)" ]; then S2URL="[ \"http://127.0.0.1:9/stage2\", \"$$H/stage2\" ]"; echo "fallback: stage2 url = [dead 127.0.0.1:9, $$H/stage2]"; fi; \
+	INLINE_ARGS=""; \
+	if [ -n '$(ARGS)' ] && [ -z "$(SIGN_ARGS)" ]; then INLINE_ARGS=", \"args\": $$(printf '%s' '$(ARGS)')"; echo "inline payload args = $(ARGS)"; fi; \
 	if [ -n "$(SIGN)" ]; then \
 		cp build/$*/linux.efi.sig "$$D/linux.efi.sig"; \
-		cp build/$*/stage2.sig "$$D/stage2.sig"; \
 		PUB=$$(cat build/keys/release.pub.b64); \
-		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"ed25519\": \"$$PUB\" }"; \
-		S2="\"$*\": { \"url\": $$S2URL, \"ed25519\": \"$$PUB\""; \
+		S1="\"$*\": { \"payload\": { \"url\": \"$$H/linux.efi\", \"ed25519\": \"$$PUB\" } }"; \
+		P2="\"url\": $$S2URL, \"ed25519\": \"$$PUB\""; \
 		if [ -n "$(SIGN_ARGS)" ]; then \
-			cp build/$*/args.json "$$D/args.json"; \
-			cp build/$*/args.json.sig "$$D/args.json.sig"; \
-			S2="$$S2, \"args_url\": \"$$H/args.json\""; \
-			echo "user-data: signed mode + signed args (pubkey $$PUB)"; \
+			cp build/$*/args.json "$$D/args.json"; cp build/$*/args.json.sig "$$D/args.json.sig"; \
+			P2="$$P2, \"args_url\": \"$$H/args.json\""; \
+		fi; \
+		if [ -n "$(MANIFEST)" ]; then \
+			S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+			printf '{ "_stage2": { "%s": { "payload": { "url": "%s/stage2", "sha256": "%s"%s } } } }\n' "$*" "$$H" "$$S2_SHA" "$$INLINE_ARGS" > "$$D/stage2.manifest.json"; \
+			$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c \
+				"openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $$D/stage2.manifest.json -out $$D/stage2.manifest.json.sig"; \
+			S2="\"$*\": { \"manifest\": { \"url\": \"$$H/stage2.manifest.json\", \"ed25519\": \"$$PUB\" } }"; \
+			echo "user-data: _stage2 via signed manifest (pubkey $$PUB)"; \
 		else \
+			cp build/$*/stage2.sig "$$D/stage2.sig"; \
+			S2="\"$*\": { \"payload\": { $$P2$$INLINE_ARGS } }"; \
 			echo "user-data: signed mode (pubkey $$PUB)"; \
 		fi; \
-		S2="$$S2 }"; \
 	else \
 		UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
 		S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
-		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"sha256\": \"$$UKI_SHA\" }"; \
-		S2="\"$*\": { \"url\": $$S2URL, \"sha256\": \"$$S2_SHA\" }"; \
+		S1="\"$*\": { \"payload\": { \"url\": \"$$H/linux.efi\", \"sha256\": \"$$UKI_SHA\" } }"; \
+		S2="\"$*\": { \"payload\": { \"url\": $$S2URL, \"sha256\": \"$$S2_SHA\"$$INLINE_ARGS } }"; \
 		echo "user-data: sha256 mode (UKI $$UKI_SHA, stage2 $$S2_SHA)"; \
 	fi; \
-	S2ARGS=""; \
-	if [ -n '$(ARGS)' ] && [ -z "$(SIGN_ARGS)" ]; then \
-		AJSON=$$(printf '%s' '$(ARGS)'); \
-		S2ARGS="\"args\": $$AJSON, "; \
-		echo "user-data: inline _stage2.args = $$AJSON"; \
-	fi; \
-	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s%s }\n}\n' "$$S1" "$$S2ARGS" "$$S2" > user-data.stage0.json; \
+	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s }\n}\n' "$$S1" "$$S2" > user-data.stage0.json; \
 	$(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \

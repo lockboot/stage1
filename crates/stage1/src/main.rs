@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
-use metadata::{Profile, UrlList, UserData, Verify};
+use metadata::{Admit, ArchConfig, Entry, ManifestRef, Profile, UrlList, UserData};
+use serde_json::Value;
 use reqwest::blocking::Client;
 use rustls::crypto::CryptoProvider;
 use sha2::{Digest, Sha256};
@@ -159,15 +160,14 @@ fn poweroff() {
 }
 
 struct ParsedData {
-    config: UserData,
     raw_json: Vec<u8>,
 }
 
 fn parse_json_to_config(data: Vec<u8>) -> Result<ParsedData> {
-    Ok(ParsedData {
-        config: serde_json::from_slice(&data).context("Failed to parse JSON")?,
-        raw_json: data,
-    })
+    // Validate it is a well-formed user-data document up front (clear early error), then keep the
+    // raw bytes: resolution works on a `serde_json::Value` so it can deep-merge signed manifests.
+    let _: UserData = serde_json::from_slice(&data).context("Failed to parse JSON")?;
+    Ok(ParsedData { raw_json: data })
 }
 
 /// Quote the pre-exec PCR state, binding the about-to-run binary via extra_data (PCR 14
@@ -231,7 +231,7 @@ fn fetch_signed_args(
 
 /// Try each payload URL until one downloads and admits (mirrors are safe — every
 /// candidate must still pass the same pin/signature).
-fn admit_payload(urls: &[String], mode: &Verify) -> Result<(Bytes, Option<Vec<String>>)> {
+fn admit_payload(urls: &[String], mode: &Admit) -> Result<(Bytes, Option<Vec<String>>)> {
     let mut last: Option<anyhow::Error> = None;
     for url in urls {
         match admit_from(url, mode) {
@@ -246,16 +246,16 @@ fn admit_payload(urls: &[String], mode: &Verify) -> Result<(Bytes, Option<Vec<St
 }
 
 /// Download one payload candidate and run admission control (a GATE — never measured).
-fn admit_from(url: &str, mode: &Verify) -> Result<(Bytes, Option<Vec<String>>)> {
+fn admit_from(url: &str, mode: &Admit) -> Result<(Bytes, Option<Vec<String>>)> {
     let binary = download_binary(url)?;
     let hash = hex::encode(sha256!(&binary));
     let mut signed_args = None;
     match mode {
-        Verify::Sha256(expected) => {
+        Admit::Sha256(expected) => {
             verify_checksum(&binary, expected)?;
             ktseprintln!("verified: sha256:{hash} (sha256 pin)");
         }
-        Verify::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
+        Admit::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
             let sig_urls = match sig_url {
                 Some(u) => substitute(&u.0, &hash),
                 None => vec![format!("{url}.sig")],
@@ -273,30 +273,149 @@ fn admit_from(url: &str, mode: &Verify) -> Result<(Bytes, Option<Vec<String>>)> 
 }
 
 fn stage2(parsed: ParsedData) -> Result<()> {
-    let stage2 = parsed
-        .config
-        .stage2
-        .as_ref()
-        .ok_or_else(|| anyhow!("no _stage2 section in user-data"))?;
-    let arch_config = stage2
-        .for_this_arch()
-        .ok_or_else(|| anyhow!("no _stage2 config for this architecture"))?;
-    let mode = arch_config
-        .validate(Profile::Stage1)
-        .map_err(|m| anyhow!("invalid _stage2 config: {m}"))?;
-
-    let (binary_data, signed_args) = admit_payload(&arch_config.url.0, &mode)?;
+    let (binary_data, args, stdin_config) = resolve_payload(&parsed.raw_json)?;
 
     if is_root() {
         generate_pre_execution_attestation(&binary_data)?;
         extend_pcrs(&binary_data)?;
     }
 
-    // Signed remote args, when present, override inline args.
-    let inline_args = stage2.args.as_deref().unwrap_or(&[]);
-    let args: &[String] = signed_args.as_deref().unwrap_or(inline_args);
-    execute_binary(&binary_data, args, &parsed.raw_json)?;
+    execute_binary(&binary_data, &args, &stdin_config)?;
     Ok(())
+}
+
+/// Resolve `_stage2.<arch>` to a concrete payload and admit it. The entry is a discriminated union:
+/// a `payload` is admitted directly (sha256 pin or ed25519-signed, + signed args); a `manifest` is
+/// fetched, verified against its pinned key, **deep-merged into the doc at the top level**, and the
+/// merged entry re-evaluated — a loop that follows a chain of signed manifests (per-hop key
+/// delegation) until it reaches a payload. Each hop is recorded in `_stage2.<arch>.resolved_manifests`
+/// (with its resolved hash); a repeated (url,hash) is a cycle and fails closed. Returns the payload
+/// bytes, its argv, and the JSON handed to stage2 on stdin (the merged doc, or — when no manifest was
+/// resolved — the received bytes byte-for-byte).
+fn resolve_payload(raw_json: &[u8]) -> Result<(Bytes, Vec<String>, Vec<u8>)> {
+    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let mut doc: Value = serde_json::from_slice(raw_json).context("re-parse user-data")?;
+    // Verifier-authoritative resolution history (a signed manifest cannot forge or erase it).
+    let mut history: Vec<ManifestRef> = Vec::new();
+
+    loop {
+        let entry_val = doc
+            .get("_stage2")
+            .and_then(|s| s.get(arch))
+            .ok_or_else(|| anyhow!("no _stage2 config for this architecture"))?;
+        let ac: ArchConfig = serde_json::from_value(entry_val.clone())
+            .map_err(|e| anyhow!("invalid _stage2 entry: {e}"))?;
+
+        match ac.entry {
+            Entry::Payload(p) => {
+                let mode = p
+                    .admission(Profile::Stage1)
+                    .map_err(|m| anyhow!("invalid _stage2 payload: {m}"))?;
+                let (binary, signed_args) = admit_payload(&p.url.0, &mode)?;
+                let args = signed_args.or(p.args).unwrap_or_default();
+                let stdin = if history.is_empty() {
+                    raw_json.to_vec() // no manifest resolved: pass the received doc through unchanged
+                } else {
+                    // Stamp the authoritative history over the arch entry, then serialize.
+                    set_resolved_manifests(&mut doc, arch, &history)?;
+                    serde_json::to_vec(&doc).context("re-serialize merged user-data")?
+                };
+                return Ok((binary, args, stdin));
+            }
+            Entry::Manifest(m) => {
+                m.validate(Profile::Stage1)
+                    .map_err(|e| anyhow!("invalid _stage2 manifest: {e}"))?;
+                let (murl, bytes, hash) = fetch_manifest(&m)?;
+                if history
+                    .iter()
+                    .any(|r| r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()])
+                {
+                    return Err(anyhow!("manifest resolution cycle at {murl} (sha256:{hash})"));
+                }
+                history.push(ManifestRef {
+                    url: UrlList(vec![murl]),
+                    ed25519: m.ed25519.clone(),
+                    sig_url: m.sig_url.clone(),
+                    sha256: Some(hash),
+                });
+                // Consume the pointer, then deep-merge the manifest fragment (manifest wins). The
+                // merged entry re-populates with a `payload` (stop) or a fresh `manifest` (delegate).
+                if let Some(e) = doc.get_mut("_stage2").and_then(|s| s.get_mut(arch)).and_then(Value::as_object_mut) {
+                    e.remove("manifest");
+                }
+                let manifest_doc: Value =
+                    serde_json::from_slice(&bytes).context("manifest is not valid JSON")?;
+                deep_merge(&mut doc, &manifest_doc);
+            }
+        }
+    }
+}
+
+/// Overwrite `_stage2.<arch>.resolved_manifests` with the verifier's authoritative chain, so the
+/// payload sees exactly the manifests that were fetched + verified (a signed manifest cannot inject
+/// its own provenance — we control this key).
+fn set_resolved_manifests(doc: &mut Value, arch: &str, history: &[ManifestRef]) -> Result<()> {
+    let entry = doc
+        .get_mut("_stage2")
+        .and_then(|s| s.get_mut(arch))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("_stage2.{arch} vanished during resolution"))?;
+    entry.insert("resolved_manifests".into(), serde_json::to_value(history)?);
+    Ok(())
+}
+
+/// Fetch a signed manifest (mirror fallback) and verify its detached signature against the pinned
+/// key. Returns the serving URL, the verified bytes, and their hex sha256.
+fn fetch_manifest(m: &ManifestRef) -> Result<(String, Bytes, String)> {
+    let mut last: Option<anyhow::Error> = None;
+    for url in &m.url.0 {
+        match try_fetch_manifest(m, url) {
+            Ok((bytes, hash)) => return Ok((url.clone(), bytes, hash)),
+            Err(e) => {
+                ktseprintln!("manifest rejected: {url} ({e:#})");
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("no manifest url provided")))
+}
+
+fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Bytes, String)> {
+    let bytes = download_binary(url)?;
+    let hash = hex::encode(sha256!(&bytes));
+    if let Some(pin) = &m.sha256 {
+        if !pin.eq_ignore_ascii_case(&hash) {
+            return Err(anyhow!("manifest sha256 mismatch: expected {pin}, got {hash}"));
+        }
+    }
+    let sig_urls = match &m.sig_url {
+        Some(u) => substitute(&u.0, &hash),
+        None => vec![format!("{url}.sig")],
+    };
+    let signature = download_first(&sig_urls)?;
+    ed25519_sign::verify(&m.ed25519, &bytes, &signature)
+        .map_err(|e| anyhow!("manifest verification failed: {e}"))?;
+    ktseprintln!("manifest verified: sha256:{hash} (ed25519 key:{})", m.ed25519);
+    Ok((bytes, hash))
+}
+
+/// Recursively merge `overlay` into `base`: two objects merge key-by-key (recursing on shared
+/// keys); anything else (a leaf, or a type mismatch) takes `overlay`. `overlay` (the signed
+/// manifest) therefore wins on every conflict.
+fn deep_merge(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        b.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
 }
 
 fn log_hash(label: &str, data: &[u8]) {
@@ -501,4 +620,64 @@ fn execute_binary(data: &[u8], args: &[String], json_config: &[u8]) -> Result<()
         );
     }
     Err(anyhow!("execveat stage2 failed: {}", io::Error::last_os_error()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A resolved manifest is deep-merged into the received doc at the **top level**: the operator's
+    /// unique keys survive, shared objects merge recursively, and the manifest's unique keys (e.g. a
+    /// release-injected `blah`) appear at the top level. After the `manifest` pointer is consumed,
+    /// the manifest supplies the `payload` for the same arch entry.
+    #[test]
+    fn manifest_deep_merges_at_top_level() {
+        // operator entry after the `manifest` key has been consumed (only resolution state left)
+        let mut doc = json!({
+            "_stage1": { "x86_64": { "payload": { "url": "http://h/uki", "sha256": "aa" } } },
+            "_stage2": { "x86_64": {} },
+        });
+        let manifest = json!({
+            "_stage2": { "x86_64": { "payload": { "url": "http://h/stage2", "sha256": "bb", "args": ["--x"] } } },
+            "blah": { "z": 2 },
+        });
+        deep_merge(&mut doc, &manifest);
+        assert_eq!(
+            doc,
+            json!({
+                "_stage1": { "x86_64": { "payload": { "url": "http://h/uki", "sha256": "aa" } } },
+                "_stage2": { "x86_64": { "payload": { "url": "http://h/stage2", "sha256": "bb", "args": ["--x"] } } },
+                "blah": { "z": 2 },
+            })
+        );
+    }
+
+    /// On a genuine leaf conflict the manifest (overlay) wins.
+    #[test]
+    fn manifest_wins_on_conflict() {
+        let mut base = json!({ "_stage2": { "x86_64": { "payload": { "args": ["operator"] } } }, "keep": 1 });
+        deep_merge(&mut base, &json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } } }));
+        assert_eq!(base, json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } }, "keep": 1 }));
+    }
+
+    /// The verifier stamps the authoritative chain over the arch entry (overwriting any value a
+    /// manifest tried to inject), as a sibling of the union key.
+    #[test]
+    fn resolved_manifests_are_verifier_authoritative() {
+        let mut doc = json!({ "_stage2": { "x86_64": { "payload": { "url": "http://h/p", "sha256": "bb" },
+                                                        "resolved_manifests": [{ "url": "http://evil", "ed25519": "FORGED" }] } } });
+        let history = vec![ManifestRef {
+            url: UrlList(vec!["http://h/m".into()]),
+            ed25519: "REALKEY".into(),
+            sig_url: None,
+            sha256: Some("cc".into()),
+        }];
+        set_resolved_manifests(&mut doc, "x86_64", &history).unwrap();
+        let rm = &doc["_stage2"]["x86_64"]["resolved_manifests"];
+        assert_eq!(rm.as_array().unwrap().len(), 1);
+        assert_eq!(rm[0]["ed25519"], "REALKEY");
+        assert_eq!(rm[0]["url"], "http://h/m");
+        assert_eq!(rm[0]["sha256"], "cc");
+    }
 }
