@@ -9,7 +9,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use ed25519_sign::{sha256_hex, sign_payload};
-use metadata::{ArchConfig, Profile, StageConfig, UrlList, UserData};
+use metadata::{ArchConfig, Manifest, Profile, StageConfig, UrlList, UserData};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,20 +44,21 @@ struct CreateArgs {
     /// The stage2 payload served for the _stage2 hop (admitted by stage1).
     #[arg(long)]
     stage2: PathBuf,
-    /// ed25519 PKCS#8 PEM. Given → sign both payloads and pin the pubkey (roll-forward);
-    /// omitted → pin an exact sha256 of each.
+    /// ed25519 PKCS#8 PEM. Given → emit a signed manifest per payload and pin the pubkey
+    /// (roll-forward); omitted → pin an exact sha256 of each inline.
     #[arg(long)]
     key: Option<PathBuf>,
     /// Mirror base URL (repeatable). http:// only — stage0 has no TLS; integrity is the pin.
     /// URLs are composed as `<base>/<arch>/<file>`.
     #[arg(long = "base-url", required = true)]
     base_url: Vec<String>,
-    /// Inline args for stage2: a JSON array of strings, e.g. '["--flag","v"]'.
+    /// Args for stage2: a JSON array of strings, e.g. '["--flag","v"]'. In ed25519 mode these
+    /// ride inside the signed manifest; in sha256 mode they are inline in the (trusted) user-data.
     #[arg(long)]
     args: Option<String>,
-    /// Serve --args as a signed remote blob (ed25519 mode) instead of inline.
-    #[arg(long, requires = "key", requires = "args")]
-    sign_args: bool,
+    /// Release version stamped into the signed manifest (ed25519 mode); an anti-rollback hint.
+    #[arg(long, default_value_t = 1)]
+    version: u64,
     /// Output directory (created if missing). user-data.json is merged across arches.
     #[arg(long)]
     out: PathBuf,
@@ -85,8 +86,10 @@ fn compose_urls(bases: &[String], arch: &str, filename: &str) -> UrlList {
     UrlList(bases.iter().map(|b| format!("{b}/{arch}/{filename}")).collect())
 }
 
-/// Write `src`'s bytes into `<arch_dir>/<filename>`, then either sign it (→ `.sig` + pinned
-/// pubkey) or hash it (→ sha256 pin). Returns the arch entry with its composed URL list.
+/// Write `src`'s bytes into `<arch_dir>/<filename>` (served), then admit-pin it. With a key
+/// (ed25519 mode) emit a **signed manifest** — `{ url, sha256, args, version }` written to
+/// `<filename>.manifest.json` (+ `.sig`) — and return an entry pointing at it. Without a key
+/// (sha256 mode) return an inline `{ url, sha256 }` entry (`args`/`version` are unused there).
 fn build_entry(
     arch_dir: &Path,
     arch: &str,
@@ -94,20 +97,42 @@ fn build_entry(
     filename: &str,
     src: &Path,
     key_pem: Option<&str>,
+    args: Option<&[String]>,
+    version: u64,
 ) -> Result<ArchConfig> {
     let bytes = fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     fs::write(arch_dir.join(filename), &bytes)
         .with_context(|| format!("writing {}/{filename}", arch_dir.display()))?;
     let url = compose_urls(bases, arch, filename);
-    let (sha256, ed25519) = match key_pem {
+    match key_pem {
         Some(pem) => {
-            let s = sign_payload(pem, &bytes)?;
-            fs::write(arch_dir.join(format!("{filename}.sig")), &s.signature)?;
-            (None, Some(s.pubkey_b64))
+            let manifest = Manifest {
+                url,
+                sha256: sha256_hex(&bytes),
+                args: args.map(<[String]>::to_vec),
+                version,
+            };
+            let manifest_json = serde_json::to_vec_pretty(&manifest)?;
+            let manifest_name = format!("{filename}.manifest.json");
+            fs::write(arch_dir.join(&manifest_name), &manifest_json)?;
+            let s = sign_payload(pem, &manifest_json)?;
+            fs::write(arch_dir.join(format!("{manifest_name}.sig")), &s.signature)?;
+            Ok(ArchConfig {
+                url: None,
+                sha256: None,
+                ed25519: Some(s.pubkey_b64),
+                manifest_url: Some(compose_urls(bases, arch, &manifest_name)),
+                manifest_sig_url: None, // verifier defaults to <manifest_url>.sig (co-located)
+            })
         }
-        None => (Some(sha256_hex(&bytes)), None),
-    };
-    Ok(ArchConfig { url, sha256, ed25519, sig_url: None, args_url: None, args_sig_url: None })
+        None => Ok(ArchConfig {
+            url: Some(url),
+            sha256: Some(sha256_hex(&bytes)),
+            ed25519: None,
+            manifest_url: None,
+            manifest_sig_url: None,
+        }),
+    }
 }
 
 fn create(a: CreateArgs) -> Result<()> {
@@ -126,25 +151,22 @@ fn create(a: CreateArgs) -> Result<()> {
         .map(|p| fs::read_to_string(p).with_context(|| format!("reading key {}", p.display())))
         .transpose()?;
 
-    let uki_entry = build_entry(&arch_dir, &a.arch, &bases, "linux.efi", &a.uki, key_pem.as_deref())?;
-    let mut stage2_entry = build_entry(&arch_dir, &a.arch, &bases, "stage2", &a.stage2, key_pem.as_deref())?;
+    // stage2 args: in ed25519 mode they ride inside the signed manifest; in sha256 mode they are
+    // inline in the (trusted) user-data. The UKI (_stage1) takes no args here.
+    let args_parsed: Option<Vec<String>> = a
+        .args
+        .as_ref()
+        .map(|j| serde_json::from_str(j).context("--args must be a JSON array of strings"))
+        .transpose()?;
+    let signed = key_pem.is_some();
+    let manifest_args = if signed { args_parsed.as_deref() } else { None };
+    let inline_args = if signed { None } else { args_parsed.clone() };
 
-    // Args: inline, or signed-and-served remotely.
-    let mut inline_args: Option<Vec<String>> = None;
-    if let Some(args_json) = &a.args {
-        let parsed: Vec<String> =
-            serde_json::from_str(args_json).context("--args must be a JSON array of strings")?;
-        if a.sign_args {
-            let blob = serde_json::to_vec(&parsed)?;
-            fs::write(arch_dir.join("args.json"), &blob)?;
-            let pem = key_pem.as_deref().expect("clap requires --key with --sign-args");
-            let s = sign_payload(pem, &blob)?;
-            fs::write(arch_dir.join("args.json.sig"), &s.signature)?;
-            stage2_entry.args_url = Some(compose_urls(&bases, &a.arch, "args.json"));
-        } else {
-            inline_args = Some(parsed);
-        }
-    }
+    let uki_entry =
+        build_entry(&arch_dir, &a.arch, &bases, "linux.efi", &a.uki, key_pem.as_deref(), None, a.version)?;
+    let stage2_entry = build_entry(
+        &arch_dir, &a.arch, &bases, "stage2", &a.stage2, key_pem.as_deref(), manifest_args, a.version,
+    )?;
 
     // Fail early on a bad config, in the profile each hop will actually be checked under.
     uki_entry.validate(Profile::Stage0).map_err(|m| anyhow!("_stage1 entry invalid: {m}"))?;
@@ -242,7 +264,7 @@ fn modify(a: ModifyArgs) -> Result<()> {
                 continue;
             }
             let Some(em) = entry.as_object_mut() else { continue };
-            for field in ["url", "sig_url", "args_url", "args_sig_url"] {
+            for field in ["url", "manifest_url", "manifest_sig_url"] {
                 if let Some(v) = em.get_mut(field) {
                     *v = rewrite_urls(v, &adds, &rems)?;
                 }
@@ -337,7 +359,7 @@ mod tests {
             key: None,
             base_url: vec!["http://cdn1".into(), "http://cdn2".into()],
             args: None,
-            sign_args: false,
+            version: 1,
             out: out.clone(),
         })
         .unwrap();
@@ -346,8 +368,64 @@ mod tests {
         validate(&out).unwrap();
         let ud: UserData =
             serde_json::from_str(&fs::read_to_string(out.join("user-data.json")).unwrap()).unwrap();
-        assert_eq!(ud.stage2.unwrap().x86_64.unwrap().url.0.len(), 2);
+        assert_eq!(ud.stage2.unwrap().x86_64.unwrap().url.unwrap().0.len(), 2);
         assert!(ud.stage1.unwrap().x86_64.unwrap().sha256.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PKCS#8 PEM for an ed25519 key with a fixed 32-byte seed (matches ed25519-sign's format).
+    fn test_pem() -> String {
+        use base64::Engine as _;
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&[7u8; 32]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n")
+    }
+
+    #[test]
+    fn create_ed25519_emits_verifiable_manifest() {
+        let dir = std::env::temp_dir().join(format!("deploy-test-ed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let uki = dir.join("uki.bin");
+        fs::write(&uki, b"fake uki").unwrap();
+        let s2 = dir.join("s2.bin");
+        fs::write(&s2, b"fake stage2").unwrap();
+        let key = dir.join("key.pem");
+        fs::write(&key, test_pem()).unwrap();
+        let out = dir.join("out");
+
+        create(CreateArgs {
+            arch: "x86_64".into(),
+            uki,
+            stage2: s2,
+            key: Some(key),
+            base_url: vec!["http://cdn1".into()],
+            args: Some(r#"["--serve","0.0.0.0:8080"]"#.into()),
+            version: 7,
+            out: out.clone(),
+        })
+        .unwrap();
+
+        // The emitted user-data validates and pins the pubkey + manifest_url (no inline payload).
+        validate(&out).unwrap();
+        let ud: UserData =
+            serde_json::from_str(&fs::read_to_string(out.join("user-data.json")).unwrap()).unwrap();
+        let s2e = ud.stage2.unwrap().x86_64.unwrap();
+        assert!(s2e.ed25519.is_some());
+        assert!(s2e.manifest_url.is_some());
+        assert!(s2e.url.is_none());
+
+        // The emitted manifest verifies against the pinned key and carries args + version.
+        let mbytes = fs::read(out.join("x86_64/stage2.manifest.json")).unwrap();
+        let sig = fs::read(out.join("x86_64/stage2.manifest.json.sig")).unwrap();
+        ed25519_sign::verify(&s2e.ed25519.unwrap(), &mbytes, &sig).unwrap();
+        let m = Manifest::parse(&mbytes, Profile::Stage1).unwrap();
+        assert_eq!(m.version, 7);
+        assert_eq!(m.args.unwrap(), vec!["--serve", "0.0.0.0:8080"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

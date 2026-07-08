@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Lock.Boot admission metadata — the `_stage1` / `_stage2` wire types + validation.
+//! Lock.Boot admission metadata -- the `_stage1` / `_stage2` wire types + validation.
 //!
-//! Shared by the stage1 **verifier** (deserialize + `validate` + `Verify`) and the
-//! deploy **emitter** (construct + serialize), so the format has one definition and can't
-//! drift. `_stage1` (stage0, the UKI hop) and `_stage2` (stage1, the payload hop) have the
-//! same shape; they differ only in transport policy, captured by [`Profile`] — stage0 is
-//! http-only (no TLS), stage1 allows https. Both allow fallback URL lists.
+//! Shared by the stage1 **verifier** (deserialize + `validate` + `Verify`) and the deploy
+//! **emitter** (construct + serialize), so the format has one definition and can't drift.
+//! `_stage1` (stage0, the UKI hop) and `_stage2` (stage1, the payload hop) have the same shape;
+//! they differ only in transport policy, captured by [`Profile`] -- stage0 is http-only (no TLS),
+//! stage1 allows https.
+//!
+//! Two admission modes per arch entry:
+//!   - **sha256** -- pin an exact hash inline (`url` + `sha256`; static payload).
+//!   - **ed25519** -- pin a release pubkey + a `manifest_url`. The stage fetches a signed
+//!     **manifest** (`{ url, sha256, args, version }`), verifies it against the pinned key, then
+//!     admits the payload by the manifest's exact `sha256`. Binding the payload + args under one
+//!     signature stops a hostile mirror from mixing-and-matching independently-signed pieces or
+//!     swapping the payload, while the release rolls forward by re-signing a new manifest.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -21,7 +29,7 @@ pub struct UserData {
     pub stage2: Option<StageConfig>,
 }
 
-/// One stage's config: shared inline `args` plus a per-architecture admission entry.
+/// One stage's config: an optional inline `args` (sha256 mode) plus a per-architecture entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,9 +59,9 @@ impl StageConfig {
     }
 }
 
-/// One URL or a fallback list, tried in order. Deserializes from a string or an array,
-/// and serializes back to a bare string when singular. Trying mirrors is safe: the
-/// payload is cryptographically pinned, so bytes from any URL must still verify.
+/// One URL or a fallback list, tried in order. Deserializes from a string or an array, and
+/// serializes back to a bare string when singular. Trying mirrors is safe: the payload is
+/// cryptographically pinned, so bytes from any URL must still verify.
 #[derive(Debug, Clone)]
 pub struct UrlList(pub Vec<String>);
 
@@ -81,98 +89,138 @@ impl Serialize for UrlList {
     }
 }
 
-/// One architecture's admission entry. Exactly one of `sha256` (pin an exact payload) or
-/// `ed25519` (pin a release pubkey; the payload rolls forward via a detached `.sig`) sets
-/// the mode — see [`ArchConfig::validate`]. Every URL field takes a string or a fallback
-/// list; `sig_url`/`args_url`/`args_sig_url` may contain a `{sha256}` placeholder.
+/// One architecture's admission entry. Exactly one of `sha256` (static, inline `url`+`sha256`)
+/// or `ed25519` (roll-forward via a signed manifest at `manifest_url`) selects the mode -- see
+/// [`ArchConfig::validate`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArchConfig {
-    pub url: UrlList,
+    /// sha256 mode: the payload URL(s). Unused in ed25519 mode (the manifest carries it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<UrlList>,
+    /// sha256 mode: the payload's exact 64-hex digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// ed25519 mode: base64 32-byte release pubkey.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ed25519: Option<String>,
-    /// Detached signature location(s); `{sha256}` → payload digest. Defaults to `<url>.sig`.
+    /// ed25519 mode: where the signed manifest is fetched from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sig_url: Option<UrlList>,
-    /// Signed remote args (ed25519 only): a JSON string array, verified against the same
-    /// key via `args_sig_url` (else `<args_url>.sig`), overriding inline `args`.
+    pub manifest_url: Option<UrlList>,
+    /// ed25519 mode: manifest signature location; `{sha256}` -> the retrieved manifest's digest.
+    /// Defaults to `<manifest_url>.sig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args_url: Option<UrlList>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args_sig_url: Option<UrlList>,
+    pub manifest_sig_url: Option<UrlList>,
 }
 
-/// Transport policy per stage: stage0 (the UKI hop) has no TLS, stage1 (the payload hop)
-/// does. Both allow fallback URL lists.
+/// The signed release manifest (ed25519 mode). Fetched from `manifest_url`, verified against the
+/// pinned release key; the payload is then admitted by its `sha256`. The verifier also merges the
+/// manifest back into the `_stage2` entry before handing the doc to the payload on stdin.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Manifest {
+    /// Payload URL(s) (mirror list). `{sha256}` is replaced with `sha256` below.
+    pub url: UrlList,
+    /// The payload's exact 64-hex digest.
+    pub sha256: String,
+    /// Args passed to the payload as argv (stage1) or LoadOptions (stage0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Monotonic release version (anti-rollback hint; enforcement is future work).
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// Transport policy per stage: stage0 (the UKI hop) has no TLS, stage1 (the payload hop) does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
-    /// `_stage1` — http:// only.
+    /// `_stage1` -- http:// only.
     Stage0,
-    /// `_stage2` — http:// or https://.
+    /// `_stage2` -- http:// or https://.
     Stage1,
 }
 
-/// Resolved admission mode. `*_url` templates still carry a raw `{sha256}`; the consumer
-/// substitutes it once the payload digest is known.
+/// Resolved admission mode. `manifest_sig_url` still carries a raw `{sha256}`; the consumer
+/// substitutes the retrieved manifest's digest.
 pub enum Verify {
     Sha256(String),
     Ed25519 {
         pubkey: String,
-        sig_url: Option<UrlList>,
-        args_url: Option<UrlList>,
-        args_sig_url: Option<UrlList>,
+        manifest_url: UrlList,
+        manifest_sig_url: Option<UrlList>,
     },
 }
 
+fn ok_url(s: &str, allow_https: bool) -> bool {
+    (s.starts_with("http://") || (allow_https && s.starts_with("https://")))
+        && s.chars().all(|c| c.is_ascii_graphic())
+}
+fn ok_list(l: &UrlList, allow_https: bool) -> bool {
+    !l.0.is_empty() && l.0.iter().all(|s| ok_url(s, allow_https))
+}
+fn ok_sha256(hex: &str) -> bool {
+    hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+impl Manifest {
+    /// Parse + validate a fetched manifest (called after its signature is verified).
+    pub fn parse(json: &[u8], profile: Profile) -> Result<Manifest, &'static str> {
+        let m: Manifest =
+            serde_json::from_slice(json).map_err(|_| "manifest is not valid JSON")?;
+        let allow_https = matches!(profile, Profile::Stage1);
+        if !ok_list(&m.url, allow_https) {
+            return Err("manifest url must be a non-empty http(s):// URL (or list), printable ASCII");
+        }
+        if !ok_sha256(&m.sha256) {
+            return Err("manifest sha256 must be exactly 64 hex characters");
+        }
+        Ok(m)
+    }
+}
+
 impl ArchConfig {
-    /// Validate the URL(s) and the single verification field, returning the selected
-    /// [`Verify`] mode. `profile` chooses the transport policy (see [`Profile`]).
+    /// Validate the arch entry and return the selected [`Verify`] mode. `profile` chooses the
+    /// transport policy (see [`Profile`]).
     pub fn validate(&self, profile: Profile) -> Result<Verify, &'static str> {
         let allow_https = matches!(profile, Profile::Stage1);
-        let ok_url = |s: &str| {
-            (s.starts_with("http://") || (allow_https && s.starts_with("https://")))
-                && s.chars().all(|c| c.is_ascii_graphic())
-        };
-        let ok_list = |l: &UrlList| !l.0.is_empty() && l.0.iter().all(|s| ok_url(s));
-        if !ok_list(&self.url) {
-            return Err("url must be a non-empty http(s):// URL (or list of them), printable ASCII");
+        if self.manifest_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+            return Err("manifest_url must be http(s):// URL(s), printable ASCII");
         }
-        if self.sig_url.as_ref().is_some_and(|l| !ok_list(l)) {
-            return Err("sig_url must be http(s):// URL(s), printable ASCII");
+        if self.manifest_sig_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+            return Err("manifest_sig_url must be http(s):// URL(s), printable ASCII");
         }
-        if self.args_url.as_ref().is_some_and(|l| !ok_list(l)) {
-            return Err("args_url must be http(s):// URL(s), printable ASCII");
-        }
-        if self.args_sig_url.as_ref().is_some_and(|l| !ok_list(l)) {
-            return Err("args_sig_url must be http(s):// URL(s), printable ASCII");
-        }
-        if self.args_sig_url.is_some() && self.args_url.is_none() {
-            return Err("args_sig_url requires args_url");
+        if self.manifest_sig_url.is_some() && self.manifest_url.is_none() {
+            return Err("manifest_sig_url requires manifest_url");
         }
         match (&self.sha256, &self.ed25519) {
             (Some(_), Some(_)) => Err("specify only one of sha256 / ed25519"),
             (None, None) => Err("must specify one of sha256 / ed25519"),
             (Some(hex), None) => {
-                // Signed args need the release key, which only signed mode pins.
-                if self.args_url.is_some() {
-                    return Err("args_url requires ed25519 signed mode");
+                if self.manifest_url.is_some() {
+                    return Err("manifest_url requires ed25519 signed mode");
                 }
-                if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let url = self.url.as_ref().ok_or("sha256 mode requires url")?;
+                if !ok_list(url, allow_https) {
+                    return Err("url must be a non-empty http(s):// URL (or list), printable ASCII");
+                }
+                if !ok_sha256(hex) {
                     return Err("sha256 must be exactly 64 hex characters");
                 }
                 Ok(Verify::Sha256(hex.clone()))
             }
-            (None, Some(pubkey)) => match STANDARD.decode(pubkey.trim()) {
-                Ok(bytes) if bytes.len() == 32 => Ok(Verify::Ed25519 {
-                    pubkey: pubkey.clone(),
-                    sig_url: self.sig_url.clone(),
-                    args_url: self.args_url.clone(),
-                    args_sig_url: self.args_sig_url.clone(),
-                }),
-                Ok(_) => Err("ed25519 pubkey must decode to 32 bytes"),
-                Err(_) => Err("ed25519 pubkey must be base64"),
-            },
+            (None, Some(pubkey)) => {
+                let manifest_url = self
+                    .manifest_url
+                    .clone()
+                    .ok_or("ed25519 mode requires manifest_url")?;
+                match STANDARD.decode(pubkey.trim()) {
+                    Ok(bytes) if bytes.len() == 32 => Ok(Verify::Ed25519 {
+                        pubkey: pubkey.clone(),
+                        manifest_url,
+                        manifest_sig_url: self.manifest_sig_url.clone(),
+                    }),
+                    Ok(_) => Err("ed25519 pubkey must decode to 32 bytes"),
+                    Err(_) => Err("ed25519 pubkey must be base64"),
+                }
+            }
         }
     }
 }
@@ -189,77 +237,122 @@ mod tests {
         STANDARD.encode(*KeyPair::from_seed(Seed::new([3u8; 32])).pk)
     }
 
-    fn ac(url: &str, sha256: Option<&str>, ed25519: Option<&str>) -> ArchConfig {
+    /// A minimal sha256-mode entry.
+    fn sha256_entry(url: &str, sha256: &str) -> ArchConfig {
         ArchConfig {
-            url: UrlList(vec![url.into()]),
-            sha256: sha256.map(Into::into),
-            ed25519: ed25519.map(Into::into),
-            sig_url: None,
-            args_url: None,
-            args_sig_url: None,
+            url: Some(UrlList(vec![url.into()])),
+            sha256: Some(sha256.into()),
+            ed25519: None,
+            manifest_url: None,
+            manifest_sig_url: None,
+        }
+    }
+
+    /// A minimal ed25519-mode entry.
+    fn ed25519_entry(pubkey: &str, manifest_url: &str) -> ArchConfig {
+        ArchConfig {
+            url: None,
+            sha256: None,
+            ed25519: Some(pubkey.into()),
+            manifest_url: Some(UrlList(vec![manifest_url.into()])),
+            manifest_sig_url: None,
         }
     }
 
     #[test]
     fn sha256_mode_ok() {
-        assert!(matches!(ac("http://h/p", Some(HASH64), None).validate(Profile::Stage1), Ok(Verify::Sha256(_))));
-    }
-
-    #[test]
-    fn https_allowed_on_stage1_only() {
-        assert!(ac("https://h/p", Some(HASH64), None).validate(Profile::Stage1).is_ok());
-        assert!(ac("https://h/p", Some(HASH64), None).validate(Profile::Stage0).is_err());
-        assert!(ac("http://h/p", Some(HASH64), None).validate(Profile::Stage0).is_ok());
+        assert!(matches!(
+            sha256_entry("http://h/p", HASH64).validate(Profile::Stage1),
+            Ok(Verify::Sha256(_))
+        ));
     }
 
     #[test]
     fn ed25519_mode_ok() {
         let pk = pubkey_b64();
-        assert!(matches!(ac("http://h/p", None, Some(&pk)).validate(Profile::Stage1), Ok(Verify::Ed25519 { .. })));
+        assert!(matches!(
+            ed25519_entry(&pk, "http://h/m.json").validate(Profile::Stage1),
+            Ok(Verify::Ed25519 { .. })
+        ));
+    }
+
+    #[test]
+    fn https_allowed_on_stage1_only() {
+        assert!(sha256_entry("https://h/p", HASH64).validate(Profile::Stage1).is_ok());
+        assert!(sha256_entry("https://h/p", HASH64).validate(Profile::Stage0).is_err());
+        let pk = pubkey_b64();
+        assert!(ed25519_entry(&pk, "https://h/m.json").validate(Profile::Stage1).is_ok());
+        assert!(ed25519_entry(&pk, "https://h/m.json").validate(Profile::Stage0).is_err());
+    }
+
+    #[test]
+    fn ed25519_requires_manifest_url() {
+        let pk = pubkey_b64();
+        let mut c = ed25519_entry(&pk, "http://h/m.json");
+        c.manifest_url = None;
+        assert!(c.validate(Profile::Stage1).is_err());
+    }
+
+    #[test]
+    fn manifest_url_requires_ed25519() {
+        let mut c = sha256_entry("http://h/p", HASH64);
+        c.manifest_url = Some(UrlList(vec!["http://h/m.json".into()]));
+        assert!(c.validate(Profile::Stage1).is_err());
+    }
+
+    #[test]
+    fn manifest_sig_url_requires_manifest_url() {
+        let mut c = sha256_entry("http://h/p", HASH64);
+        c.manifest_sig_url = Some(UrlList(vec!["http://h/m.json.sig".into()]));
+        assert!(c.validate(Profile::Stage1).is_err());
+    }
+
+    #[test]
+    fn sha256_mode_requires_url() {
+        let mut c = sha256_entry("http://h/p", HASH64);
+        c.url = None;
+        assert!(c.validate(Profile::Stage1).is_err());
     }
 
     #[test]
     fn both_modes_is_error() {
         let pk = pubkey_b64();
-        assert!(ac("http://h/p", Some(HASH64), Some(&pk)).validate(Profile::Stage1).is_err());
+        let mut c = sha256_entry("http://h/p", HASH64);
+        c.ed25519 = Some(pk);
+        c.manifest_url = Some(UrlList(vec!["http://h/m.json".into()]));
+        assert!(c.validate(Profile::Stage1).is_err());
     }
 
     #[test]
     fn neither_mode_is_error() {
-        assert!(ac("http://h/p", None, None).validate(Profile::Stage1).is_err());
+        let c = ArchConfig { url: None, sha256: None, ed25519: None, manifest_url: None, manifest_sig_url: None };
+        assert!(c.validate(Profile::Stage1).is_err());
     }
 
     #[test]
     fn bad_hex_is_error() {
-        assert!(ac("http://h/p", Some("zz"), None).validate(Profile::Stage1).is_err());
+        assert!(sha256_entry("http://h/p", "zz").validate(Profile::Stage1).is_err());
         let sixtyfour_nonhex = "z".repeat(64);
-        assert!(ac("http://h/p", Some(&sixtyfour_nonhex), None).validate(Profile::Stage1).is_err());
+        assert!(sha256_entry("http://h/p", &sixtyfour_nonhex).validate(Profile::Stage1).is_err());
     }
 
     #[test]
     fn bad_pubkey_is_error() {
-        assert!(ac("http://h/p", None, Some("not-base64!!")).validate(Profile::Stage1).is_err());
-        assert!(ac("http://h/p", None, Some("AAAA")).validate(Profile::Stage1).is_err());
+        assert!(ed25519_entry("not-base64!!", "http://h/m.json").validate(Profile::Stage1).is_err());
+        assert!(ed25519_entry("AAAA", "http://h/m.json").validate(Profile::Stage1).is_err());
     }
 
     #[test]
-    fn non_http_url_is_error() {
-        assert!(ac("ftp://h/p", Some(HASH64), None).validate(Profile::Stage1).is_err());
-    }
-
-    #[test]
-    fn args_url_requires_ed25519() {
-        let mut c = ac("http://h/p", Some(HASH64), None);
-        c.args_url = Some(UrlList(vec!["http://h/args".into()]));
-        assert!(c.validate(Profile::Stage1).is_err());
-    }
-
-    #[test]
-    fn args_sig_url_requires_args_url() {
-        let pk = pubkey_b64();
-        let mut c = ac("http://h/p", None, Some(&pk));
-        c.args_sig_url = Some(UrlList(vec!["http://h/args.sig".into()]));
-        assert!(c.validate(Profile::Stage1).is_err());
+    fn manifest_parse_validates() {
+        let good = br#"{ "url": "https://h/p", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "args": ["--x"], "version": 3 }"#;
+        let m = Manifest::parse(good, Profile::Stage1).unwrap();
+        assert_eq!(m.sha256.len(), 64);
+        assert_eq!(m.version, 3);
+        // https rejected under Stage0 (no TLS)
+        assert!(Manifest::parse(good, Profile::Stage0).is_err());
+        // bad sha256 rejected
+        let bad = br#"{ "url": "http://h/p", "sha256": "nope" }"#;
+        assert!(Manifest::parse(bad, Profile::Stage1).is_err());
     }
 
     #[test]
@@ -274,10 +367,10 @@ mod tests {
 
     #[test]
     fn url_list_validates_and_rejects_empty() {
-        let mut c = ac("http://h/p", Some(HASH64), None);
-        c.url = UrlList(vec!["http://h/p".into(), "https://mirror/p".into()]);
+        let mut c = sha256_entry("http://h/p", HASH64);
+        c.url = Some(UrlList(vec!["http://h/p".into(), "https://mirror/p".into()]));
         assert!(c.validate(Profile::Stage1).is_ok());
-        c.url = UrlList(vec![]);
+        c.url = Some(UrlList(vec![]));
         assert!(c.validate(Profile::Stage1).is_err());
     }
 }

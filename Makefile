@@ -203,30 +203,10 @@ build/keys/release.pem: docker-build-base
 		openssl pkey -in build/keys/release.pem -pubout -outform DER \
 			| tail -c 32 | base64 -w0 > build/keys/release.pub.b64"
 
-# Detached ed25519 sigs over the UKI and stage2 (SIGN=1). ed25519 is deterministic, so
-# `openssl pkeyutl -rawin` yields the exact bytes stage0/stage1 verify against the pinned
-# pubkey. Served as <name>.sig; each verifier fetches <url>.sig in ed25519 mode.
-build/%/linux.efi.sig: tools/build-uki/%/linux.efi build/keys/release.pem
-	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
-		mkdir -p build/$* && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in tools/build-uki/$*/linux.efi -out build/$*/linux.efi.sig"
-
-build/%/stage2.sig: build/%/stage2 build/keys/release.pem
-	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
-		mkdir -p build/$* && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in build/$*/stage2 -out build/$*/stage2.sig"
-
-# Signed remote args for SIGN_ARGS=1: a JSON array of strings, ed25519-signed like the
-# payloads. stage1 fetches args.json + args.json.sig, verifies against the pinned key,
-# and uses them as argv (overriding inline _stage2.args).
-build/%/args.json.sig: build/keys/release.pem
-	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
-		mkdir -p build/$* && \
-		printf '%s' '[\"--from\",\"signed-args\"]' > build/$*/args.json && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in build/$*/args.json -out build/$*/args.json.sig"
+# In ed25519 mode each hop is admitted via a signed **manifest** ({ url, sha256, args,
+# version }); the manifests are built + signed inside the test-chain recipe (below) because
+# their `args` and mirror lists vary per run. ed25519 is deterministic, so `openssl pkeyutl
+# -rawin` yields the exact bytes stage0/stage1 verify against the pinned pubkey.
 
 # Guard the arch-less form with a helpful message instead of "no rule to make target".
 .PHONY: test-chain
@@ -238,18 +218,14 @@ test-chain:
 # local dir. One served user-data carries `_stage1` (stage0 admits the UKI) and `_stage2`
 # (stage1 admits the leaf); the two parsers coexist on distinct keys. Hashes are computed
 # from the local files so the doc can't go stale. Modes:
-#   (default)    sha256 pins for both hops.
-#   SIGN=1       ed25519 for BOTH hops: serve linux.efi.sig + stage2.sig, pin the release
-#                pubkey in _stage1 and _stage2 (payloads roll forward under a stable key).
-#   SIGN_ARGS=1  (implies SIGN) also serve signed args.json (+ .sig) and set _stage2.args_url,
-#                exercising stage1's signed-remote-args path.
-#   ARGS='[..]'  set inline _stage2.args to this JSON array (ignored when SIGN_ARGS is set,
-#                which supplies its own signed args). Used by the smoke-args-% target.
-#   FALLBACK=1   make the _stage2 url a list [dead 127.0.0.1:9, real] so stage1's mirror
-#                fallback is exercised (the first url refuses, the second serves).
-test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
-		$(if $(SIGN),build/%/linux.efi.sig build/%/stage2.sig) \
-		$(if $(SIGN_ARGS),build/%/args.json.sig)
+#   (default)    sha256 pins for both hops (inline in the trusted user-data).
+#   SIGN=1       ed25519 for BOTH hops: build + sign a manifest per hop ({ url, sha256, args,
+#                version }), pin the release pubkey + manifest_url in _stage1 / _stage2.
+#   ARGS='[..]'  stage2 args (JSON array). In SIGN mode they ride inside the signed manifest;
+#                in sha256 mode they are inline _stage2.args. Used by the smoke-args-% target.
+#   FALLBACK=1   make the _stage2 fetch URL a list [dead 127.0.0.1:9, real] so stage1's mirror
+#                fallback is exercised (SIGN: the manifest_url list; sha256: the payload url).
+test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 $(if $(SIGN),build/keys/release.pem)
 	@if [ ! -f "$(STAGE0_BOOT_DISK)" ]; then \
 		echo "Missing external stage0 boot disk: $(STAGE0_BOOT_DISK)" >&2; \
 		echo "Build it first:  (cd $(STAGE0_DIR) && make build-$*)" >&2; \
@@ -259,54 +235,49 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 	@D="build/$*/chain"; rm -rf "$$D"; mkdir -p "$$D"; H="http://$(SERVE_HOST)"; \
 	cp tools/build-uki/$*/linux.efi "$$D/linux.efi"; \
 	cp build/$*/stage2 "$$D/stage2"; \
-	S2URL="\"$$H/stage2\""; \
-	if [ -n "$(FALLBACK)" ]; then S2URL="[ \"http://127.0.0.1:9/stage2\", \"$$H/stage2\" ]"; echo "fallback: stage2 url = [dead 127.0.0.1:9, $$H/stage2]"; fi; \
+	UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
+	S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+	ARGSJSON="[]"; if [ -n '$(ARGS)' ]; then ARGSJSON=$$(printf '%s' '$(ARGS)'); fi; \
 	if [ -n "$(SIGN)" ]; then \
-		cp build/$*/linux.efi.sig "$$D/linux.efi.sig"; \
-		cp build/$*/stage2.sig "$$D/stage2.sig"; \
 		PUB=$$(cat build/keys/release.pub.b64); \
-		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"ed25519\": \"$$PUB\" }"; \
-		S2="\"$*\": { \"url\": $$S2URL, \"ed25519\": \"$$PUB\""; \
-		if [ -n "$(SIGN_ARGS)" ]; then \
-			cp build/$*/args.json "$$D/args.json"; \
-			cp build/$*/args.json.sig "$$D/args.json.sig"; \
-			S2="$$S2, \"args_url\": \"$$H/args.json\""; \
-			echo "user-data: signed mode + signed args (pubkey $$PUB)"; \
-		else \
-			echo "user-data: signed mode (pubkey $$PUB)"; \
-		fi; \
-		S2="$$S2 }"; \
+		printf '{ "url": "%s/linux.efi", "sha256": "%s", "args": [], "version": 1 }\n' "$$H" "$$UKI_SHA" > "$$D/linux.efi.manifest.json"; \
+		printf '{ "url": "%s/stage2", "sha256": "%s", "args": %s, "version": 1 }\n' "$$H" "$$S2_SHA" "$$ARGSJSON" > "$$D/stage2.manifest.json"; \
+		$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+			openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $$D/linux.efi.manifest.json -out $$D/linux.efi.manifest.json.sig && \
+			openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $$D/stage2.manifest.json -out $$D/stage2.manifest.json.sig"; \
+		S2MURL="\"$$H/stage2.manifest.json\""; \
+		if [ -n "$(FALLBACK)" ]; then S2MURL="[ \"http://127.0.0.1:9/stage2.manifest.json\", \"$$H/stage2.manifest.json\" ]"; echo "fallback: stage2 manifest_url = [dead 127.0.0.1:9, real]"; fi; \
+		S1="\"$*\": { \"ed25519\": \"$$PUB\", \"manifest_url\": \"$$H/linux.efi.manifest.json\" }"; \
+		S2="\"$*\": { \"ed25519\": \"$$PUB\", \"manifest_url\": $$S2MURL }"; \
+		echo "user-data: signed manifest mode (pubkey $$PUB, stage2 args $$ARGSJSON)"; \
+		printf '{\n  "_stage1": { %s },\n  "_stage2": { %s }\n}\n' "$$S1" "$$S2" > user-data.stage0.json; \
 	else \
-		UKI_SHA=$$(sha256sum "$$D/linux.efi" | cut -d' ' -f1); \
-		S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
+		S2URL="\"$$H/stage2\""; \
+		if [ -n "$(FALLBACK)" ]; then S2URL="[ \"http://127.0.0.1:9/stage2\", \"$$H/stage2\" ]"; echo "fallback: stage2 url = [dead 127.0.0.1:9, real]"; fi; \
 		S1="\"$*\": { \"url\": \"$$H/linux.efi\", \"sha256\": \"$$UKI_SHA\" }"; \
 		S2="\"$*\": { \"url\": $$S2URL, \"sha256\": \"$$S2_SHA\" }"; \
-		echo "user-data: sha256 mode (UKI $$UKI_SHA, stage2 $$S2_SHA)"; \
+		S2ARGS=""; if [ -n '$(ARGS)' ]; then S2ARGS="\"args\": $$ARGSJSON, "; fi; \
+		echo "user-data: sha256 mode (UKI $$UKI_SHA, stage2 $$S2_SHA, args $$ARGSJSON)"; \
+		printf '{\n  "_stage1": { %s },\n  "_stage2": { %s%s }\n}\n' "$$S1" "$$S2ARGS" "$$S2" > user-data.stage0.json; \
 	fi; \
-	S2ARGS=""; \
-	if [ -n '$(ARGS)' ] && [ -z "$(SIGN_ARGS)" ]; then \
-		AJSON=$$(printf '%s' '$(ARGS)'); \
-		S2ARGS="\"args\": $$AJSON, "; \
-		echo "user-data: inline _stage2.args = $$AJSON"; \
-	fi; \
-	printf '{\n  "_stage1": { %s },\n  "_stage2": { %s%s }\n}\n' "$$S1" "$$S2ARGS" "$$S2" > user-data.stage0.json; \
 	$(DOCKER_RUN) $(DOCKER_OPT_KVM) \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \
 			--boot-disk "$(STAGE0_BOOT_DISK)" \
 			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace)
 
-# ---- Smoke test: _stage2 args actually reach the payload's argv ----
-# Boot the full chain with a known inline args array (one arg contains a space, to prove
-# it is a real argv vector and not shell word-splitting) and assert the payload echoed it.
-# The signed-remote-args path is covered separately by `test-chain-% SIGN=1 SIGN_ARGS=1`.
+# ---- Smoke test: _stage2 args reach the payload's argv (via the signed manifest) ----
+# Boot the full chain in ed25519 signed mode with a known args array (one arg contains a
+# space, to prove a real argv vector and not shell word-splitting) carried inside the signed
+# manifest, and assert the payload echoed it. Also exercises the manifest->stdin merge. The
+# sha256 inline-args path is the simpler subset (`test-chain-% ARGS=...` with no SIGN).
 .PHONY: smoke-args-%
 smoke-args-%:
 	@log="build/$*/smoke-args.log"; mkdir -p "build/$*"; \
-	$(MAKE) test-chain-$* ARGS='["--smoke","hello world"]' 2>&1 | tee "$$log"; \
+	$(MAKE) test-chain-$* SIGN=1 ARGS='["--smoke","hello world"]' 2>&1 | tee "$$log"; \
 	echo "=== smoke-args assertion ==="; \
 	if grep -q 'arg\[1\]: --smoke' "$$log" && grep -q 'arg\[2\]: hello world' "$$log"; then \
-		echo "PASS: inline _stage2.args reached the payload argv (spaces preserved)"; \
+		echo "PASS: signed-manifest _stage2.args reached the payload argv (spaces preserved)"; \
 	else \
 		echo "FAIL: expected 'arg[1]: --smoke' and 'arg[2]: hello world' in the console output"; \
 		exit 1; \
