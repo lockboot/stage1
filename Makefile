@@ -193,8 +193,8 @@ STAGE0_BOOT_DISK ?= $(STAGE0_DIR)/build/$*/boot.disk
 # stage0's DNS4 on the _stage1 hop (the _stage2 hop then needs guest DNS).
 SERVE_HOST ?= 10.0.2.1:8000
 
-# The deploy CLI (lockboot-deploy) is the canonical signer + keygen; the tests dogfood it instead
-# of shelling out to openssl, so the exact signing + domain-separation code paths are exercised.
+# The deploy CLI (lockboot-deploy) is the canonical signer + keygen; the tests dogfood it so the
+# exact signing + domain-separation code paths are exercised.
 # Built in the container; a musl static binary that runs there. cargo no-ops when up to date.
 DEPLOY := target/x86_64-unknown-linux-musl/debug/lockboot-deploy
 .PHONY: deploy-bin

@@ -196,7 +196,7 @@ mod tests {
 
     /// Cross-repo wire-contract anchor: this exact (key, domain, message) -> signature must also
     /// hold in stage0's verifier (github.com/lockboot/stage0). If either repo's framing drifts,
-    /// this fails. Values are base64 (no hex dep).
+    /// this fails. Values are base64.
     #[test]
     fn golden_kat() {
         let s = sign(&pem_from_seed(&[7u8; 32]), Domain::Stage1Manifest, b"lockboot-kat").unwrap();

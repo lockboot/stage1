@@ -114,7 +114,7 @@ lockboot-deploy modify ./deploy --add-base-url http://cdn3   # add / --remove-ba
 
 `create` writes `deploy/<arch>/{linux.efi,stage2}` (+ `.sig` in signed mode) and merges `deploy/user-data.json`; sync the directory to each mirror and pass `user-data.json` as the instance's user-data. It shares the `metadata` types with the stage1 verifier, so what it emits is exactly what stage0/stage1 accept. (`tools/publish.sh` remains as a simpler UKI-only uploader; the bootable cloud image — the stage0 Secure Boot root — is published from the [stage0 repo](https://github.com/lockboot/stage0).)
 
-The release key comes from `lockboot-deploy keygen --out release.pem --pub release.pub.b64` (a PKCS#8 ed25519 key; randomness is read from `/dev/urandom`, so it builds with no host C toolchain), and `lockboot-deploy sign --domain <role> --key release.pem --in <file> --out <file>.sig` produces one domain-separated signature — the low-level primitive the test Makefile drives for each artifact. There is no `openssl` in the signing path.
+The release key comes from `lockboot-deploy keygen --out release.pem --pub release.pub.b64` (a PKCS#8 ed25519 key; randomness is read from `/dev/urandom`, so it builds with no host C toolchain), and `lockboot-deploy sign --domain <role> --key release.pem --in <file> --out <file>.sig` produces one domain-separated signature — the low-level primitive the test Makefile drives for each artifact.
 
 ## Crates
 

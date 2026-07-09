@@ -132,8 +132,8 @@ fn keygen(a: KeygenArgs) -> Result<()> {
     Ok(())
 }
 
-/// 32 cryptographically-random bytes from the kernel CSPRNG via `/dev/urandom`. Uses only `std`
-/// (no `getrandom`/`libc`/`rand`), so the tool builds with no C toolchain on the host.
+/// 32 cryptographically-random bytes from the kernel CSPRNG via `/dev/urandom` (std-only, so the
+/// tool needs no C toolchain on the host).
 fn random_seed() -> Result<[u8; 32]> {
     use std::io::Read;
     let mut seed = [0u8; 32];
