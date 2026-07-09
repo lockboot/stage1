@@ -34,7 +34,9 @@ RUN apt-get -qq update && \
 # Reproducible builds environment
 ENV SOURCE_DATE_EPOCH=0
 ENV CARGO_INCREMENTAL=0
-ENV RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static -C link-arg=-static"
+# Linker/static rustflags live in .cargo/config.toml, scoped per target. A global RUSTFLAGS here
+# would apply to every target (forcing +crt-static onto the host, breaking proc-macros) and would
+# override the per-target config, so it is intentionally not set.
 
 # User environment (project-specific cargo/rustup data)
 ENV HOME=/src
