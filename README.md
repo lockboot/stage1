@@ -67,6 +67,8 @@ stage1 admits its stage2 payload from a `_stage2` block in the instance's user-d
 
 The optional `manifest.sha256` also pins the manifest's own bytes. Every hop is recorded in the merged entry's `resolved_manifests` array (each with the resolved hash + verifying key) — verifier-authoritative provenance the payload sees on stdin. You don't hand-write these docs: the [`deploy` tool](#deploy) below signs the payloads/manifests and generates the `user-data.json`.
 
+**Domain separation.** Every ed25519 signature in the chain is over a fixed 64-byte preimage `sha256(domain_tag) || sha256(message)`, where the tag names the exact role. There are six roles across the two hops — `lockboot.v1.stage1.uki` / `.stage1.args` / `.stage1.manifest` (stage0 admits the UKI hop) and `lockboot.v1.stage2.payload` / `.stage2.args` / `.stage2.manifest` (stage1 admits the payload hop). Because the role is bound into what gets signed, a signature minted for one context is structurally invalid in every other: a signed-args blob can't be replayed as a payload signature, a `_stage1` manifest can't stand in for a `_stage2` one, and so on. `deploy` and `stage1` share the framing via the `ed25519-sign` crate; stage0's independent verifier is pinned to it byte-for-byte by a shared golden known-answer test.
+
 **Fallback URLs.** Every URL field (`url`, `sig_url`, `args_url`, `args_sig_url`, `manifest.url`) accepts either a single string **or a list of strings** tried in order — for mirror resiliency. Because the payload is cryptographically pinned, any mirror that yields verifying bytes is accepted; a dead or wrong mirror is simply skipped. URLs may be `http://` or `https://`, and the `*_url` fields may contain a `{sha256}` placeholder (replaced with the payload's — or manifest's — hex digest, for content-addressed signatures):
 
 ```json
@@ -112,11 +114,13 @@ lockboot-deploy modify ./deploy --add-base-url http://cdn3   # add / --remove-ba
 
 `create` writes `deploy/<arch>/{linux.efi,stage2}` (+ `.sig` in signed mode) and merges `deploy/user-data.json`; sync the directory to each mirror and pass `user-data.json` as the instance's user-data. It shares the `metadata` types with the stage1 verifier, so what it emits is exactly what stage0/stage1 accept. (`tools/publish.sh` remains as a simpler UKI-only uploader; the bootable cloud image — the stage0 Secure Boot root — is published from the [stage0 repo](https://github.com/lockboot/stage0).)
 
+The release key comes from `lockboot-deploy keygen --out release.pem --pub release.pub.b64` (a PKCS#8 ed25519 key; randomness is read from `/dev/urandom`, so it builds with no host C toolchain), and `lockboot-deploy sign --domain <role> --key release.pem --in <file> --out <file>.sig` produces one domain-separated signature — the low-level primitive the test Makefile drives for each artifact. There is no `openssl` in the signing path.
+
 ## Crates
 
 - **`stage1`** — the on-instance PID-1 bootloader baked into the UKI (verify-only: admit → measure → exec).
 - **`metadata`** — the `_stage1`/`_stage2` wire types + `validate()`, shared by the stage1 verifier and the deploy emitter (one source of truth, no drift).
-- **`ed25519-sign`** — the ed25519 sign/verify + sha256 primitive (the cross-repo wire contract), used by `mkuki`, `deploy`, and `stage1`.
+- **`ed25519-sign`** — the domain-separated ed25519 sign/verify (`sha256(domain_tag) || sha256(message)`) + sha256 primitive (the cross-repo wire contract, with a golden known-answer test), used by `mkuki`, `deploy`, and `stage1`.
 - **`mkuki`** — reproducible UKI assembler (kernel + gzip'd cpio layers → PE, optional `ed25519` signature); a build-host tool.
 - **`deploy`** — the deployment tool above (`lockboot-deploy`); a build-host tool.
 - **`example-stage2`** — a minimal example leaf payload; copy it as a template for your own stage2.
