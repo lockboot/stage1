@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use ed25519_sign::{sha256_hex, sign_payload};
+use ed25519_sign::{pem_from_seed, pubkey_b64_from_seed, sha256_hex, sign, Domain};
 use metadata::{ArchConfig, Entry, ManifestRef, Payload, Profile, StageConfig, UrlList, UserData};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -23,6 +23,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Generate an ed25519 release key (PKCS#8 PEM) and print its base64 public key.
+    Keygen(KeygenArgs),
+    /// Sign one file for a signing domain (low-level; used by the build/test tooling).
+    Sign(SignArgs),
     /// Sign/pin the UKI and stage2 for one arch, compose mirror URLs, emit into --out.
     Create(CreateArgs),
     /// Validate a user-data doc (both _stage1 and _stage2) against the admission rules.
@@ -32,6 +36,33 @@ enum Cmd {
     },
     /// Edit an existing deployment's user-data.json: add/remove mirror base URLs.
     Modify(ModifyArgs),
+}
+
+#[derive(Args)]
+struct KeygenArgs {
+    /// Write the ed25519 PKCS#8 PEM private key here (created mode 0600).
+    #[arg(long)]
+    out: PathBuf,
+    /// Also write the base64 public key here (the value pinned in `ed25519` metadata fields).
+    #[arg(long = "pub")]
+    pub_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SignArgs {
+    /// Signing domain: one of stage1.uki / stage1.args / stage1.manifest /
+    /// stage2.payload / stage2.args / stage2.manifest.
+    #[arg(long)]
+    domain: String,
+    /// ed25519 PKCS#8 PEM private key.
+    #[arg(long)]
+    key: PathBuf,
+    /// File to sign.
+    #[arg(long = "in")]
+    input: PathBuf,
+    /// Write the detached signature here.
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Args)]
@@ -80,10 +111,62 @@ struct ModifyArgs {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Keygen(a) => keygen(a),
+        Cmd::Sign(a) => sign_file(a),
         Cmd::Create(a) => create(a),
         Cmd::Validate { path } => validate(&path),
         Cmd::Modify(a) => modify(a),
     }
+}
+
+/// Generate a random ed25519 key, write the PKCS#8 PEM (mode 0600), and print its base64 pubkey.
+fn keygen(a: KeygenArgs) -> Result<()> {
+    let seed = random_seed()?;
+    let pubkey = pubkey_b64_from_seed(&seed);
+    write_private(&a.out, pem_from_seed(&seed).as_bytes())?;
+    if let Some(pub_path) = &a.pub_out {
+        fs::write(pub_path, &pubkey).with_context(|| format!("writing {}", pub_path.display()))?;
+    }
+    println!("wrote {} (ed25519 private key, mode 0600)", a.out.display());
+    println!("pubkey: {pubkey}");
+    Ok(())
+}
+
+/// 32 cryptographically-random bytes from the kernel CSPRNG via `/dev/urandom` (std-only, so the
+/// tool needs no C toolchain on the host).
+fn random_seed() -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut seed = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("open /dev/urandom")?
+        .read_exact(&mut seed)
+        .context("read /dev/urandom")?;
+    Ok(seed)
+}
+
+/// Sign one file for `--domain` with `--key`, writing the detached signature to `--out`.
+fn sign_file(a: SignArgs) -> Result<()> {
+    let domain: Domain = a.domain.parse().map_err(|e| anyhow!("--domain {}: {e}", a.domain))?;
+    let pem = fs::read_to_string(&a.key).with_context(|| format!("reading key {}", a.key.display()))?;
+    let bytes = fs::read(&a.input).with_context(|| format!("reading {}", a.input.display()))?;
+    let s = sign(&pem, domain, &bytes)?;
+    fs::write(&a.out, &s.signature).with_context(|| format!("writing {}", a.out.display()))?;
+    println!("signed {} [{}] -> {} (pubkey {})", a.input.display(), domain.tag(), a.out.display(), s.pubkey_b64);
+    Ok(())
+}
+
+/// Write `bytes` to `path`, creating it mode 0600 (private key material).
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 fn compose_urls(bases: &[String], arch: &str, filename: &str) -> UrlList {
@@ -99,6 +182,7 @@ fn build_payload(
     filename: &str,
     src: &Path,
     key_pem: Option<&str>,
+    domain: Domain,
 ) -> Result<Payload> {
     let bytes = fs::read(src).with_context(|| format!("reading {}", src.display()))?;
     fs::write(arch_dir.join(filename), &bytes)
@@ -106,7 +190,7 @@ fn build_payload(
     let url = compose_urls(bases, arch, filename);
     let (sha256, ed25519) = match key_pem {
         Some(pem) => {
-            let s = sign_payload(pem, &bytes)?;
+            let s = sign(pem, domain, &bytes)?;
             fs::write(arch_dir.join(format!("{filename}.sig")), &s.signature)?;
             (None, Some(s.pubkey_b64))
         }
@@ -132,12 +216,13 @@ fn wrap_manifest(
     filename: &str,
     payload: Payload,
     pem: &str,
+    domain: Domain,
 ) -> Result<ArchConfig> {
     let manifest = json!({ stage_key: { arch: { "payload": serde_json::to_value(&payload)? } } });
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     let name = format!("{filename}.manifest.json");
     fs::write(arch_dir.join(&name), &bytes)?;
-    let s = sign_payload(pem, &bytes)?;
+    let s = sign(pem, domain, &bytes)?;
     fs::write(arch_dir.join(format!("{name}.sig")), &s.signature)?;
     Ok(ArchConfig {
         entry: Entry::Manifest(ManifestRef {
@@ -173,8 +258,10 @@ fn create(a: CreateArgs) -> Result<()> {
     // In manifest mode the inner payload is sha256-pinned (the manifest signature covers it);
     // in direct mode the payload itself is signed with the key (or sha256-pinned when no key).
     let payload_key = if a.manifest { None } else { key_pem.as_deref() };
-    let uki_payload = build_payload(&arch_dir, &a.arch, &bases, "linux.efi", &a.uki, payload_key)?;
-    let mut stage2_payload = build_payload(&arch_dir, &a.arch, &bases, "stage2", &a.stage2, payload_key)?;
+    let uki_payload =
+        build_payload(&arch_dir, &a.arch, &bases, "linux.efi", &a.uki, payload_key, Domain::Stage1Uki)?;
+    let mut stage2_payload =
+        build_payload(&arch_dir, &a.arch, &bases, "stage2", &a.stage2, payload_key, Domain::Stage2Payload)?;
 
     // Args ride inside the stage2 payload: inline, or served as a separately-signed blob
     // (ed25519 direct mode). In manifest mode args are always inline (bound by the manifest sig).
@@ -185,7 +272,7 @@ fn create(a: CreateArgs) -> Result<()> {
             let blob = serde_json::to_vec(&parsed)?;
             fs::write(arch_dir.join("args.json"), &blob)?;
             let pem = key_pem.as_deref().expect("clap requires --key with --sign-args");
-            let s = sign_payload(pem, &blob)?;
+            let s = sign(pem, Domain::Stage2Args, &blob)?;
             fs::write(arch_dir.join("args.json.sig"), &s.signature)?;
             stage2_payload.args_url = Some(compose_urls(&bases, &a.arch, "args.json"));
         } else {
@@ -196,8 +283,8 @@ fn create(a: CreateArgs) -> Result<()> {
     let (uki_entry, stage2_entry) = if a.manifest {
         let pem = key_pem.as_deref().expect("clap requires --key with --manifest");
         (
-            wrap_manifest(&arch_dir, &a.arch, &bases, "_stage1", "linux.efi", uki_payload, pem)?,
-            wrap_manifest(&arch_dir, &a.arch, &bases, "_stage2", "stage2", stage2_payload, pem)?,
+            wrap_manifest(&arch_dir, &a.arch, &bases, "_stage1", "linux.efi", uki_payload, pem, Domain::Stage1Manifest)?,
+            wrap_manifest(&arch_dir, &a.arch, &bases, "_stage2", "stage2", stage2_payload, pem, Domain::Stage2Manifest)?,
         )
     } else {
         (direct_entry(uki_payload), direct_entry(stage2_payload))
@@ -401,15 +488,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PKCS#8 PEM for an ed25519 key with a fixed 32-byte seed (matches ed25519-sign's format).
+    /// PKCS#8 PEM for an ed25519 key with a fixed 32-byte seed (via the shared signer).
     fn test_pem() -> String {
-        use base64::Engine as _;
-        let mut der = vec![
-            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-        ];
-        der.extend_from_slice(&[7u8; 32]);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
-        format!("-----BEGIN PRIVATE KEY-----\n{b64}\n-----END PRIVATE KEY-----\n")
+        pem_from_seed(&[7u8; 32])
     }
 
     #[test]
@@ -445,7 +526,7 @@ mod tests {
         // payload carries the sha256 pin + the (bound) args.
         let mbytes = fs::read(out.join("x86_64/stage2.manifest.json")).unwrap();
         let sig = fs::read(out.join("x86_64/stage2.manifest.json.sig")).unwrap();
-        ed25519_sign::verify(&mref.ed25519, &mbytes, &sig).unwrap();
+        ed25519_sign::verify(&mref.ed25519, Domain::Stage2Manifest, &mbytes, &sig).unwrap();
         let frag: UserData = serde_json::from_slice(&mbytes).unwrap();
         let Entry::Payload(p) = frag.stage2.unwrap().x86_64.unwrap().entry else { panic!("expected payload") };
         assert!(p.sha256.is_some());

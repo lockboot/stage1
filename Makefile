@@ -193,40 +193,45 @@ STAGE0_BOOT_DISK ?= $(STAGE0_DIR)/build/$*/boot.disk
 # stage0's DNS4 on the _stage1 hop (the _stage2 hop then needs guest DNS).
 SERVE_HOST ?= 10.0.2.1:8000
 
-# ed25519 release key for SIGN=1 (signed-mode admission). stage0 only ever sees the
-# public half, pinned in the _stage1 doc; the private key signs the UKI. Generated
-# in the build container (gitignored under build/keys).
-build/keys/release.pem: docker-build-base
+# The deploy CLI (lockboot-deploy) is the canonical signer + keygen; the tests dogfood it so the
+# exact signing + domain-separation code paths are exercised.
+# Built in the container; a musl static binary that runs there. cargo no-ops when up to date.
+DEPLOY := target/x86_64-unknown-linux-musl/debug/lockboot-deploy
+.PHONY: deploy-bin
+deploy-bin: docker-build-base
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) cargo build -p deploy
+
+# ed25519 release key for SIGN=1 (signed-mode admission). stage0 only ever sees the public half,
+# pinned in the _stage1 doc; the private key signs the UKI. Generated in the build container
+# (gitignored under build/keys) by `lockboot-deploy keygen`.
+build/keys/release.pem: docker-build-base | deploy-bin
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
 		mkdir -p build/keys && \
-		openssl genpkey -algorithm ed25519 -out build/keys/release.pem && \
-		openssl pkey -in build/keys/release.pem -pubout -outform DER \
-			| tail -c 32 | base64 -w0 > build/keys/release.pub.b64"
+		$(DEPLOY) keygen --out build/keys/release.pem --pub build/keys/release.pub.b64"
 
-# Detached ed25519 sigs over the UKI and stage2 (SIGN=1). ed25519 is deterministic, so
-# `openssl pkeyutl -rawin` yields the exact bytes stage0/stage1 verify against the pinned
-# pubkey. Served as <name>.sig; each verifier fetches <url>.sig in ed25519 mode.
-build/%/linux.efi.sig: tools/build-uki/%/linux.efi build/keys/release.pem
+# Detached, domain-separated ed25519 sigs over the UKI and stage2 (SIGN=1): lockboot-deploy signs
+# sha256(domain)||sha256(payload), which stage0/stage1 verify against the pinned pubkey. Served as
+# <name>.sig; each verifier fetches <url>.sig in ed25519 mode.
+build/%/linux.efi.sig: tools/build-uki/%/linux.efi build/keys/release.pem | deploy-bin
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
 		mkdir -p build/$* && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in tools/build-uki/$*/linux.efi -out build/$*/linux.efi.sig"
+		$(DEPLOY) sign --domain stage1.uki --key build/keys/release.pem \
+			--in tools/build-uki/$*/linux.efi --out build/$*/linux.efi.sig"
 
-build/%/stage2.sig: build/%/stage2 build/keys/release.pem
+build/%/stage2.sig: build/%/stage2 build/keys/release.pem | deploy-bin
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
 		mkdir -p build/$* && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in build/$*/stage2 -out build/$*/stage2.sig"
+		$(DEPLOY) sign --domain stage2.payload --key build/keys/release.pem \
+			--in build/$*/stage2 --out build/$*/stage2.sig"
 
-# Signed remote args for SIGN_ARGS=1: a JSON array of strings, ed25519-signed like the
-# payloads. stage1 fetches args.json + args.json.sig, verifies against the pinned key,
-# and uses them as argv (overriding inline _stage2.args).
-build/%/args.json.sig: build/keys/release.pem
+# Signed remote args for SIGN_ARGS=1: a JSON array of strings, domain-signed like the payloads.
+# stage1 fetches args.json + args.json.sig, verifies against the pinned key, and uses them as argv.
+build/%/args.json.sig: build/keys/release.pem | deploy-bin
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
 		mkdir -p build/$* && \
 		printf '%s' '[\"--from\",\"signed-args\"]' > build/$*/args.json && \
-		openssl pkeyutl -sign -inkey build/keys/release.pem -rawin \
-			-in build/$*/args.json -out build/$*/args.json.sig"
+		$(DEPLOY) sign --domain stage2.args --key build/keys/release.pem \
+			--in build/$*/args.json --out build/$*/args.json.sig"
 
 # Guard the arch-less form with a helpful message instead of "no rule to make target".
 .PHONY: test-chain
@@ -281,7 +286,7 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 			S2_SHA=$$(sha256sum "$$D/stage2" | cut -d' ' -f1); \
 			printf '{ "_stage2": { "%s": { "payload": { "url": "%s/stage2", "sha256": "%s"%s } } } }\n' "$*" "$$H" "$$S2_SHA" "$$INLINE_ARGS" > "$$D/stage2.manifest.json"; \
 			$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c \
-				"openssl pkeyutl -sign -inkey build/keys/release.pem -rawin -in $$D/stage2.manifest.json -out $$D/stage2.manifest.json.sig"; \
+				"$(DEPLOY) sign --domain stage2.manifest --key build/keys/release.pem --in $$D/stage2.manifest.json --out $$D/stage2.manifest.json.sig"; \
 			S2="\"$*\": { \"manifest\": { \"url\": \"$$H/stage2.manifest.json\", \"ed25519\": \"$$PUB\" } }"; \
 			echo "user-data: _stage2 via signed manifest (pubkey $$PUB)"; \
 		else \

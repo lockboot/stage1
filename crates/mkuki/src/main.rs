@@ -136,7 +136,7 @@ fn main() -> Result<()> {
     if let Some(key_path) = &args.sign_key {
         let pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("reading signing key {}", key_path.display()))?;
-        let s = sign::sign_payload(&pem, &image)?;
+        let s = sign::sign(&pem, sign::Domain::Stage1Uki, &image)?;
         let sig_path = sig_path(&args.out);
         std::fs::write(&sig_path, &s.signature)
             .with_context(|| format!("writing {}", sig_path.display()))?;

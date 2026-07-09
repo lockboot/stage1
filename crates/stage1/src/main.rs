@@ -221,7 +221,7 @@ fn fetch_signed_args(
     };
     let args_bytes = download_first(&args_urls)?;
     let signature = download_first(&args_sig_urls)?;
-    ed25519_sign::verify(pubkey, &args_bytes, &signature)
+    ed25519_sign::verify(pubkey, ed25519_sign::Domain::Stage2Args, &args_bytes, &signature)
         .map_err(|m| anyhow!("signed args verification failed: {m}"))?;
     let args: Vec<String> = serde_json::from_slice(&args_bytes)
         .context("signed args must be a JSON array of strings")?;
@@ -261,7 +261,7 @@ fn admit_from(url: &str, mode: &Admit) -> Result<(Bytes, Option<Vec<String>>)> {
                 None => vec![format!("{url}.sig")],
             };
             let signature = download_first(&sig_urls)?;
-            ed25519_sign::verify(pubkey, &binary, &signature)
+            ed25519_sign::verify(pubkey, ed25519_sign::Domain::Stage2Payload, &binary, &signature)
                 .map_err(|m| anyhow!("ed25519 verification failed: {m}"))?;
             ktseprintln!("verified: sha256:{hash} (ed25519 key:{pubkey})");
             if let Some(au) = args_url {
@@ -393,7 +393,7 @@ fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Bytes, String)> {
         None => vec![format!("{url}.sig")],
     };
     let signature = download_first(&sig_urls)?;
-    ed25519_sign::verify(&m.ed25519, &bytes, &signature)
+    ed25519_sign::verify(&m.ed25519, ed25519_sign::Domain::Stage2Manifest, &bytes, &signature)
         .map_err(|e| anyhow!("manifest verification failed: {e}"))?;
     ktseprintln!("manifest verified: sha256:{hash} (ed25519 key:{})", m.ed25519);
     Ok((bytes, hash))
