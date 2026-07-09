@@ -10,6 +10,10 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-static",
+    # Remap the embedded dep source paths to a fixed prefix so the build does not depend on where
+    # CARGO_HOME is (CI uses /tmp/.cargo, local uses /src/.cargo); makes CI and local byte-identical.
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
 ]
 
 [target.x86_64-unknown-linux-gnu]
@@ -24,6 +28,8 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-static",
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
 ]
 
 [env]
