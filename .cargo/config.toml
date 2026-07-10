@@ -10,6 +10,15 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-static",
+    # Remap the embedded dep source paths to a fixed prefix so the build does not depend on where
+    # CARGO_HOME is (CI uses /tmp/.cargo, local uses /src/.cargo); makes CI and local byte-identical.
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
+    # If rust-src is installed (rust-analyzer does this locally; CI's fresh toolchain has not), rustc
+    # emits std panic-location paths from the sysroot instead of the baked /rustc/<hash>. Remap the
+    # sysroot rust-src path to that same /rustc/<hash> so local matches CI. UPDATE THE HASH when
+    # bumping the toolchain (rustc -Vv commit-hash); a stale value silently no-ops (CI==local catches it).
+    "--remap-path-prefix=/src/.rustup/toolchains/1.91.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust=/rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb",
 ]
 
 [target.x86_64-unknown-linux-gnu]
@@ -24,6 +33,9 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-static",
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
+    "--remap-path-prefix=/src/.rustup/toolchains/1.91.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust=/rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb",
 ]
 
 [env]
