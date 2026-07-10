@@ -143,6 +143,17 @@ tools/build-uki/mkuki: docker-build-base
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
 		bash -c "cargo build --release --locked -p mkuki --target x86_64-unknown-linux-musl && cp -v target/x86_64-unknown-linux-musl/release/mkuki $@"
 
+# Regenerate tools/build-uki/fedora-deps.mk (pinned, GPG-verified kernel + systemd-boot stub).
+#   make update-fedora-deps FCOS=44.20260621.3.1 [SYSTEMD=259.6-1.fc44] [KERNEL=<nvr>]
+# Kernel NVR is read from the FCOS build manifest; the stub is pulled from Fedora (explicit SYSTEMD,
+# else latest stable via Bodhi). Every RPM's Fedora GPG signature is verified before it is pinned.
+.PHONY: update-fedora-deps
+update-fedora-deps: docker-build-base
+	@[ -n "$(FCOS)" ] || [ -n "$(KERNEL)" ] || { echo "set FCOS=<version> (and optionally SYSTEMD=<nvr>)"; exit 1; }
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
+		python3 tools/build-uki/update-fedora-deps.py \
+			$(if $(FCOS),--fcos $(FCOS)) $(if $(SYSTEMD),--systemd $(SYSTEMD)) $(if $(KERNEL),--kernel $(KERNEL))
+
 
 #####################################################################
 # Runtime container image (busybox + stage1) -> ghcr on uki-v* tags.

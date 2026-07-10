@@ -15,6 +15,7 @@ RUN apt-get -qq update && \
     fdisk \
     findutils \
     gdisk \
+    gnupg \
     gzip \
     kmod \
     make \
@@ -23,6 +24,7 @@ RUN apt-get -qq update && \
     python3 \
     python3-pip \
     qemu-efi-aarch64 \
+    rpm \
     rpm2cpio \
     sbsigntool \
     util-linux \
