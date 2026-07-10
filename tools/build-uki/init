@@ -68,6 +68,18 @@ mod vhost
 mod vhost_vsock
 mod nitro_enclaves
 
+# Storage stack for a containerized stage2 (keel). Must load here, before the
+# modules_disabled latch below makes module loading impossible for the payload.
+# Dependency modules (reed_solomon for dm-verity FEC, netfs for erofs) are loaded
+# explicitly rather than relying on modprobe auto-pull: once the latch is set, a
+# dep that was not already resolved can never be loaded on demand.
+mod dm-crypt
+mod overlay
+mod reed_solomon
+mod dm-verity
+mod netfs
+mod erofs
+
 #####################################################################
 # Lock down kernel before handing off to stage1/stage2.
 #
