@@ -28,71 +28,13 @@ DEFAULT_STAGE2_URL = https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2
 user-data.json:
 	wget -O "$@" $(DEFAULT_STAGE2_URL)
 
-# ---- Docker images (shared lockboot family; built locally, never published) ----
-# BUILD_IMAGE compiles everything; HARNESS_IMAGE (from stage0) runs the qemu chain
-# test. Both are built by the workspace `make image` from stage0 (the canonical
-# Dockerfiles); a standalone CI clone builds BUILD_IMAGE itself via docker-build-base.
-BUILD_IMAGE   = lockboot:build
-HARNESS_IMAGE = lockboot:harness
+# ---- Shared build harness (docker images + DOCKER_RUN plumbing) ----
+# Vendored byte-identically from stage0/build.mk (the canonical source) via the workspace
+# `make sync-harness`; do not hand-edit. `make check-harness` guards against drift.
+include build.mk
+
+# stage1-only: runtime OCI image tag for the docker-runtime / buildx targets below.
 RUNTIME_IMAGE ?= lockboot:latest
-
-.PHONY: docker-build-base
-docker-build-base:
-	docker build -f Dockerfile.build -t $(BUILD_IMAGE) .
-
-# ---- Docker run plumbing (keep identical across repos; mirrors stage0/Makefile) ----
-# Own build artifacts by whoever owns the checkout, not the caller's euid. Under
-# `gh act` the caller is root but the bind-mounted tree is still yours, so stat
-# keeps output user-owned instead of trampling the project dir with root files.
-USER_ID  := $(shell stat -c %u .)
-GROUP_ID := $(shell stat -c %g .)
-
-KVM_GID   := $(shell stat -c %g /dev/kvm 2>/dev/null || echo "")
-KVM_MOUNT := $(shell test -e /dev/kvm && echo "-v /dev/kvm:/dev/kvm")
-DOCKER_OPT_KVM := $(if $(KVM_GID),--group-add $(KVM_GID)) $(KVM_MOUNT)
-
-# Recursive-docker passthrough: the UKI rule and runtime-image build shell out to
-# the HOST docker daemon (rootfs extraction / buildx), so forward the socket + gid.
-DOCKER_SOCK_GID   := $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo "")
-DOCKER_SOCK_MOUNT := $(shell test -e /var/run/docker.sock && echo "-v /var/run/docker.sock:/var/run/docker.sock")
-DOCKER_OPT_DOCKER := $(DOCKER_SOCK_MOUNT) $(if $(DOCKER_SOCK_GID),--group-add $(DOCKER_SOCK_GID))
-
-DOCKER_SAMEUSER := -u $(USER_ID):$(GROUP_ID)
-
-# Host-path translation for docker-in-devcontainer. Inside the devcontainer /src is
-# a host bind mount and the inner Docker talks to the HOST daemon, which cannot
-# resolve /src/... paths; translate $(CURDIR) to the real host path (the bracketed
-# subpath findmnt reports for the /src bind). On the host CURDIR is not under /src,
-# so this is a pass-through and your workflow is unchanged. Keep identical across repos.
-HOST_DIR := $(CURDIR)
-ifneq ($(filter /src/%,$(CURDIR)),)
-  SRC_BIND := $(shell findmnt -fnro SOURCE --target /src 2>/dev/null | sed -n 's/.*\[\(.*\)\]$$/\1/p')
-  ifneq ($(SRC_BIND),)
-    HOST_DIR := $(SRC_BIND)$(CURDIR:/src%=%)
-  endif
-endif
-
-# Mount the WORKSPACE (parent of this repo) at /src so builds reuse the shared
-# workspace-level .cargo/.rustup (matching the devcontainer), instead of creating
-# per-repo copies. The repo then lives at /src/$(REPO_NAME).
-REPO_NAME := $(notdir $(HOST_DIR))
-HOST_WS   := $(patsubst %/,%,$(dir $(HOST_DIR)))
-
-# Under CI / `gh act` (CI=true, runs as root) keep cargo/rustup caches ephemeral
-# inside the container, so root-owned dirs never land in the bind-mounted project.
-# Locally (no CI) the image's CARGO_HOME=/src/.cargo + RUSTUP_HOME=/src/.rustup win,
-# i.e. the shared workspace caches.
-CACHE_ENV := $(if $(CI),-e CARGO_HOME=/tmp/.cargo -e RUSTUP_HOME=/tmp/.rustup)
-
-DOCKER_RUN = docker run --rm \
-	--privileged \
-	-v $(HOST_WS):/src \
-	-h lockboot \
-	--add-host lockboot:127.0.0.1 \
-	-e OWNER_UID=$(USER_ID) \
-	-e OWNER_GID=$(GROUP_ID) \
-	$(CACHE_ENV) \
-	-w /src/$(REPO_NAME)
 
 docker-shell-base: docker-build-base
 	$(DOCKER_RUN) -ti $(DOCKER_SAMEUSER) $(DOCKER_OPT_DOCKER) $(DOCKER_OPT_KVM) $(BUILD_IMAGE) bash
