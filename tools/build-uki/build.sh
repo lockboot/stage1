@@ -121,18 +121,33 @@ REQUIRED_MODULES=(
     "drivers/misc/nsm.ko"
     "drivers/virt/nitro_enclaves/nitro_enclaves.ko"
 
-    # Storage stack for a containerized stage2 (keel): encrypted data partition
-    # (dm-crypt), integrity-checked read-only runtime partition (dm-verity over
-    # erofs), and the containerd overlay snapshotter. init loads them all
-    # explicitly before the modules_disabled latch (the payload cannot load them
-    # itself), including the dependency modules reed_solomon (dm-verity FEC) and
+    # Storage stack for a containerized stage2: authenticated-encrypted data
+    # partition (dm-integrity + dm-crypt AEAD), integrity-checked read-only runtime
+    # partition (dm-verity over erofs), and the overlay root snapshotter. init loads
+    # them all explicitly before the modules_disabled latch (the payload cannot load
+    # them itself), including the dependency modules reed_solomon (dm-verity FEC) and
     # netfs (erofs) -- we do not rely on modprobe auto-pull.
     "drivers/md/dm-crypt.ko"
+    # dm-integrity selects ASYNC_XOR for its journal; async_xor -> async_tx (ASYNC_CORE),
+    # both =m here (xor_blocks is built-in). Loaded before dm-integrity below.
+    "crypto/async_tx/async_tx.ko"
+    "crypto/async_tx/async_xor.ko"
+    "drivers/md/dm-integrity.ko"
     "drivers/md/dm-verity.ko"
     "lib/reed_solomon/reed_solomon.ko"
     "fs/overlayfs/overlay.ko"
     "fs/erofs/erofs.ko"
     "fs/netfs/netfs.ko"
+
+    # NVMe disk driver, so stage2 can see the persistent volume (EC2 EBS is NVMe;
+    # the harness also attaches its disk as NVMe). Never needed to boot (initramfs +
+    # in-memory payload), so it was previously absent. Dep chain, loaded in order by
+    # init: hkdf -> nvme-auth, nvme-keyring -> nvme-core -> nvme.
+    "crypto/hkdf.ko"
+    "drivers/nvme/common/nvme-auth.ko"
+    "drivers/nvme/common/nvme-keyring.ko"
+    "drivers/nvme/host/nvme-core.ko"
+    "drivers/nvme/host/nvme.ko"
 )
 
 for mod_path in "${REQUIRED_MODULES[@]}"; do

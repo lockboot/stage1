@@ -74,11 +74,21 @@ mod nitro_enclaves
 # explicitly rather than relying on modprobe auto-pull: once the latch is set, a
 # dep that was not already resolved can never be loaded on demand.
 mod dm-crypt
+mod async_tx
+mod async_xor
+mod dm-integrity
 mod overlay
 mod reed_solomon
 mod dm-verity
 mod netfs
 mod erofs
+
+# NVMe disk driver (EC2 EBS + the harness disk are NVMe). Deps in order.
+mod hkdf
+mod nvme-auth
+mod nvme-keyring
+mod nvme-core
+mod nvme
 
 #####################################################################
 # Lock down kernel before handing off to stage1/stage2.
