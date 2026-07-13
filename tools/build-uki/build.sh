@@ -120,6 +120,35 @@ REQUIRED_MODULES=(
     # Nitro Enclaves
     "drivers/misc/nsm.ko"
     "drivers/virt/nitro_enclaves/nitro_enclaves.ko"
+
+    # Storage stack for stage2. init loads these explicitly, in dependency order, before
+    # the modules_disabled latch (the payload cannot load them itself, and once the latch
+    # is set an unresolved dependency can never be pulled on demand -- so we list deps too,
+    # not relying on modprobe auto-pull). What each provides / can be used for:
+    #   dm-crypt      block-device encryption (stage2 uses it for the encrypted /data)
+    #   dm-verity     integrity-checked read-only device (stage2's dm-verity'd erofs runtime)
+    #   reed_solomon  dm-verity forward-error-correction dependency
+    #   overlay       overlay filesystem (stage2's ephemeral overlay root)
+    #   erofs/netfs   read-only image filesystem (+ its netfs dependency)
+    # Extension point: authenticated (not just confidential) /data would additionally need
+    # dm-integrity + its async_xor -> async_tx (ASYNC_XOR journal) deps; omitted while stage2
+    # uses confidentiality-only dm-crypt, to keep the measured initramfs minimal.
+    "drivers/md/dm-crypt.ko"
+    "drivers/md/dm-verity.ko"
+    "lib/reed_solomon/reed_solomon.ko"
+    "fs/overlayfs/overlay.ko"
+    "fs/erofs/erofs.ko"
+    "fs/netfs/netfs.ko"
+
+    # NVMe disk driver, so stage2 can see the persistent volume (EC2 EBS is NVMe;
+    # the harness also attaches its disk as NVMe). Never needed to boot (initramfs +
+    # in-memory payload), so it was previously absent. Dep chain, loaded in order by
+    # init: hkdf -> nvme-auth, nvme-keyring -> nvme-core -> nvme.
+    "crypto/hkdf.ko"
+    "drivers/nvme/common/nvme-auth.ko"
+    "drivers/nvme/common/nvme-keyring.ko"
+    "drivers/nvme/host/nvme-core.ko"
+    "drivers/nvme/host/nvme.ko"
 )
 
 for mod_path in "${REQUIRED_MODULES[@]}"; do

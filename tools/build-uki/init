@@ -68,6 +68,27 @@ mod vhost
 mod vhost_vsock
 mod nitro_enclaves
 
+# Storage stack for stage2. Must load here, before the modules_disabled latch below
+# makes module loading impossible for the payload. Dependencies are loaded explicitly,
+# in order (not via modprobe auto-pull): once the latch is set, an unresolved dep can
+# never be loaded on demand. Provides: dm-crypt (block encryption, e.g. /data), dm-verity
+# (integrity-checked RO device) + reed_solomon (its FEC dep), overlay (overlay root),
+# erofs + netfs (RO image fs + dep). Authenticated /data would re-add dm-integrity
+# (+ async_tx/async_xor); omitted while stage2 uses confidentiality-only dm-crypt.
+mod dm-crypt
+mod overlay
+mod reed_solomon
+mod dm-verity
+mod netfs
+mod erofs
+
+# NVMe disk driver (EC2 EBS + the harness disk are NVMe). Deps in order.
+mod hkdf
+mod nvme-auth
+mod nvme-keyring
+mod nvme-core
+mod nvme
+
 #####################################################################
 # Lock down kernel before handing off to stage1/stage2.
 #
