@@ -121,18 +121,19 @@ REQUIRED_MODULES=(
     "drivers/misc/nsm.ko"
     "drivers/virt/nitro_enclaves/nitro_enclaves.ko"
 
-    # Storage stack for a containerized stage2: authenticated-encrypted data
-    # partition (dm-integrity + dm-crypt AEAD), integrity-checked read-only runtime
-    # partition (dm-verity over erofs), and the overlay root snapshotter. init loads
-    # them all explicitly before the modules_disabled latch (the payload cannot load
-    # them itself), including the dependency modules reed_solomon (dm-verity FEC) and
-    # netfs (erofs) -- we do not rely on modprobe auto-pull.
+    # Storage stack for stage2. init loads these explicitly, in dependency order, before
+    # the modules_disabled latch (the payload cannot load them itself, and once the latch
+    # is set an unresolved dependency can never be pulled on demand -- so we list deps too,
+    # not relying on modprobe auto-pull). What each provides / can be used for:
+    #   dm-crypt      block-device encryption (stage2 uses it for the encrypted /data)
+    #   dm-verity     integrity-checked read-only device (stage2's dm-verity'd erofs runtime)
+    #   reed_solomon  dm-verity forward-error-correction dependency
+    #   overlay       overlay filesystem (stage2's ephemeral overlay root)
+    #   erofs/netfs   read-only image filesystem (+ its netfs dependency)
+    # Extension point: authenticated (not just confidential) /data would additionally need
+    # dm-integrity + its async_xor -> async_tx (ASYNC_XOR journal) deps; omitted while stage2
+    # uses confidentiality-only dm-crypt, to keep the measured initramfs minimal.
     "drivers/md/dm-crypt.ko"
-    # dm-integrity selects ASYNC_XOR for its journal; async_xor -> async_tx (ASYNC_CORE),
-    # both =m here (xor_blocks is built-in). Loaded before dm-integrity below.
-    "crypto/async_tx/async_tx.ko"
-    "crypto/async_tx/async_xor.ko"
-    "drivers/md/dm-integrity.ko"
     "drivers/md/dm-verity.ko"
     "lib/reed_solomon/reed_solomon.ko"
     "fs/overlayfs/overlay.ko"
