@@ -4,12 +4,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use metadata::{Admit, ArchConfig, Entry, ManifestRef, Profile, UrlList, UserData};
-use serde_json::Value;
 use reqwest::blocking::Client;
 use rustls::crypto::CryptoProvider;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use vaportpm_attest::{PcrOps, Tpm};
-use vaportpm_attest as tpm;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -17,11 +15,15 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use vaportpm_attest as tpm;
+use vaportpm_attest::{PcrOps, Tpm};
 
 const EC2_TOKEN_URL: &str = "http://169.254.169.254/latest/api/token";
 const EC2_METADATA_URL: &str = "http://169.254.169.254/latest/user-data";
-const GCP_METADATA_URL: &str = "http://metadata.google.internal/computeMetadata/v1/instance/attributes/user-data";
-const AZURE_METADATA_URL: &str = "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-02-01&format=text";
+const GCP_METADATA_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/user-data";
+const AZURE_METADATA_URL: &str =
+    "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-02-01&format=text";
 const TMP_DIR: &str = "/tmp";
 
 // stage1 measures only loaded code: PCR 14 = SHA-256 of the stage2 binary, nothing else.
@@ -74,7 +76,8 @@ fn main_inner() -> Result<()> {
                 .to_string()
                 .into_bytes()
         };
-        return Ok(println!("{}", tpm::attest(&nonce)?));
+        println!("{}", tpm::attest(&nonce)?);
+        return Ok(());
     }
 
     // Default (and the PID-1 boot path): fetch the user-data doc from cloud metadata.
@@ -90,12 +93,14 @@ fn stdin_config() -> Result<Option<Vec<u8>>> {
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return Ok(None);
     }
-    let kind = st.st_mode as u32 & libc::S_IFMT as u32;
-    if kind != libc::S_IFREG as u32 && kind != libc::S_IFIFO as u32 {
+    let kind = st.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFREG && kind != libc::S_IFIFO {
         return Ok(None); // tty / char device / socket -> not a piped config
     }
     let mut buf = Vec::new();
-    io::stdin().read_to_end(&mut buf).context("read config from stdin")?;
+    io::stdin()
+        .read_to_end(&mut buf)
+        .context("read config from stdin")?;
     if buf.is_empty() {
         return Ok(None);
     }
@@ -221,8 +226,13 @@ fn fetch_signed_args(
     };
     let args_bytes = download_first(&args_urls)?;
     let signature = download_first(&args_sig_urls)?;
-    ed25519_sign::verify(pubkey, ed25519_sign::Domain::Stage2Args, &args_bytes, &signature)
-        .map_err(|m| anyhow!("signed args verification failed: {m}"))?;
+    ed25519_sign::verify(
+        pubkey,
+        ed25519_sign::Domain::Stage2Args,
+        &args_bytes,
+        &signature,
+    )
+    .map_err(|m| anyhow!("signed args verification failed: {m}"))?;
     let args: Vec<String> = serde_json::from_slice(&args_bytes)
         .context("signed args must be a JSON array of strings")?;
     ktseprintln!("args: {} signed (ed25519)", args.len());
@@ -255,14 +265,24 @@ fn admit_from(url: &str, mode: &Admit) -> Result<(Bytes, Option<Vec<String>>)> {
             verify_checksum(&binary, expected)?;
             ktseprintln!("verified: sha256:{hash} (sha256 pin)");
         }
-        Admit::Ed25519 { pubkey, sig_url, args_url, args_sig_url } => {
+        Admit::Ed25519 {
+            pubkey,
+            sig_url,
+            args_url,
+            args_sig_url,
+        } => {
             let sig_urls = match sig_url {
                 Some(u) => substitute(&u.0, &hash),
                 None => vec![format!("{url}.sig")],
             };
             let signature = download_first(&sig_urls)?;
-            ed25519_sign::verify(pubkey, ed25519_sign::Domain::Stage2Payload, &binary, &signature)
-                .map_err(|m| anyhow!("ed25519 verification failed: {m}"))?;
+            ed25519_sign::verify(
+                pubkey,
+                ed25519_sign::Domain::Stage2Payload,
+                &binary,
+                &signature,
+            )
+            .map_err(|m| anyhow!("ed25519 verification failed: {m}"))?;
             ktseprintln!("verified: sha256:{hash} (ed25519 key:{pubkey})");
             if let Some(au) = args_url {
                 signed_args = Some(fetch_signed_args(au, args_sig_url.as_ref(), pubkey, &hash)?);
@@ -293,7 +313,11 @@ fn stage2(parsed: ParsedData) -> Result<()> {
 /// bytes, its argv, and the JSON handed to stage2 on stdin (the merged doc, or — when no manifest was
 /// resolved — the received bytes byte-for-byte).
 fn resolve_payload(raw_json: &[u8]) -> Result<(Bytes, Vec<String>, Vec<u8>)> {
-    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
     let mut doc: Value = serde_json::from_slice(raw_json).context("re-parse user-data")?;
     // Verifier-authoritative resolution history (a signed manifest cannot forge or erase it).
     let mut history: Vec<ManifestRef> = Vec::new();
@@ -326,11 +350,12 @@ fn resolve_payload(raw_json: &[u8]) -> Result<(Bytes, Vec<String>, Vec<u8>)> {
                 m.validate(Profile::Stage1)
                     .map_err(|e| anyhow!("invalid _stage2 manifest: {e}"))?;
                 let (murl, bytes, hash) = fetch_manifest(&m)?;
-                if history
-                    .iter()
-                    .any(|r| r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()])
-                {
-                    return Err(anyhow!("manifest resolution cycle at {murl} (sha256:{hash})"));
+                if history.iter().any(|r| {
+                    r.sha256.as_deref() == Some(hash.as_str()) && r.url.0 == [murl.clone()]
+                }) {
+                    return Err(anyhow!(
+                        "manifest resolution cycle at {murl} (sha256:{hash})"
+                    ));
                 }
                 history.push(ManifestRef {
                     url: UrlList(vec![murl]),
@@ -340,7 +365,11 @@ fn resolve_payload(raw_json: &[u8]) -> Result<(Bytes, Vec<String>, Vec<u8>)> {
                 });
                 // Consume the pointer, then deep-merge the manifest fragment (manifest wins). The
                 // merged entry re-populates with a `payload` (stop) or a fresh `manifest` (delegate).
-                if let Some(e) = doc.get_mut("_stage2").and_then(|s| s.get_mut(arch)).and_then(Value::as_object_mut) {
+                if let Some(e) = doc
+                    .get_mut("_stage2")
+                    .and_then(|s| s.get_mut(arch))
+                    .and_then(Value::as_object_mut)
+                {
                     e.remove("manifest");
                 }
                 let manifest_doc: Value =
@@ -385,7 +414,9 @@ fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Bytes, String)> {
     let hash = hex::encode(sha256!(&bytes));
     if let Some(pin) = &m.sha256 {
         if !pin.eq_ignore_ascii_case(&hash) {
-            return Err(anyhow!("manifest sha256 mismatch: expected {pin}, got {hash}"));
+            return Err(anyhow!(
+                "manifest sha256 mismatch: expected {pin}, got {hash}"
+            ));
         }
     }
     let sig_urls = match &m.sig_url {
@@ -393,9 +424,17 @@ fn try_fetch_manifest(m: &ManifestRef, url: &str) -> Result<(Bytes, String)> {
         None => vec![format!("{url}.sig")],
     };
     let signature = download_first(&sig_urls)?;
-    ed25519_sign::verify(&m.ed25519, ed25519_sign::Domain::Stage2Manifest, &bytes, &signature)
-        .map_err(|e| anyhow!("manifest verification failed: {e}"))?;
-    ktseprintln!("manifest verified: sha256:{hash} (ed25519 key:{})", m.ed25519);
+    ed25519_sign::verify(
+        &m.ed25519,
+        ed25519_sign::Domain::Stage2Manifest,
+        &bytes,
+        &signature,
+    )
+    .map_err(|e| anyhow!("manifest verification failed: {e}"))?;
+    ktseprintln!(
+        "manifest verified: sha256:{hash} (ed25519 key:{})",
+        m.ed25519
+    );
     Ok((bytes, hash))
 }
 
@@ -451,7 +490,7 @@ fn try_fetch_ec2(client: &Client) -> Result<ParsedData> {
         .context("Failed to read EC2 user-data response")?
         .to_vec();
     log_hash(EC2_METADATA_URL, &body);
-    Ok(parse_json_to_config(body)?)
+    parse_json_to_config(body)
 }
 
 /// Try to fetch user-data from GCP metadata service
@@ -466,7 +505,7 @@ fn try_fetch_gcp(client: &Client) -> Result<ParsedData> {
         .context("Failed to read GCP user-data response")?
         .to_vec();
     log_hash(GCP_METADATA_URL, &body);
-    Ok(parse_json_to_config(body)?)
+    parse_json_to_config(body)
 }
 
 /// Try to fetch user-data from Azure IMDS
@@ -518,7 +557,8 @@ fn verify_checksum(data: &[u8], expected_hex: &str) -> Result<()> {
     if actual_hex.to_lowercase() != expected_hex.to_lowercase() {
         return Err(anyhow!(
             "SHA256 checksum mismatch!\nExpected: {}\nActual:   {}",
-            expected_hex, actual_hex
+            expected_hex,
+            actual_hex
         ));
     }
     Ok(())
@@ -535,7 +575,8 @@ const MFD_EXEC: libc::c_uint = 0x0010;
 fn make_memfd(name: &str, data: &[u8], seal: bool, exec: bool) -> Result<OwnedFd> {
     let cname = CString::new(name).expect("memfd name has no interior NUL");
     let base: libc::c_uint = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
-    let mut raw = unsafe { libc::memfd_create(cname.as_ptr(), base | if exec { MFD_EXEC } else { 0 }) };
+    let mut raw =
+        unsafe { libc::memfd_create(cname.as_ptr(), base | if exec { MFD_EXEC } else { 0 }) };
     if raw < 0 && exec && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
         // Pre-6.3 kernel: no MFD_EXEC. New memfds are executable by default there.
         raw = unsafe { libc::memfd_create(cname.as_ptr(), base) };
@@ -548,7 +589,11 @@ fn make_memfd(name: &str, data: &[u8], seal: bool, exec: bool) -> Result<OwnedFd
     let mut rest = data;
     while !rest.is_empty() {
         let n = unsafe {
-            libc::write(fd.as_raw_fd(), rest.as_ptr() as *const libc::c_void, rest.len())
+            libc::write(
+                fd.as_raw_fd(),
+                rest.as_ptr() as *const libc::c_void,
+                rest.len(),
+            )
         };
         if n < 0 {
             return Err(io::Error::last_os_error()).context("write to memfd");
@@ -559,7 +604,8 @@ fn make_memfd(name: &str, data: &[u8], seal: bool, exec: bool) -> Result<OwnedFd
     if seal {
         // No writable mmap is outstanding (we only wrote via write(2)), so F_SEAL_WRITE
         // takes. SHRINK/GROW/SEAL lock the size and the seal set itself.
-        let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
             return Err(io::Error::last_os_error()).context("F_ADD_SEALS on payload");
         }
@@ -569,7 +615,10 @@ fn make_memfd(name: &str, data: &[u8], seal: bool, exec: bool) -> Result<OwnedFd
 
 /// Build a NULL-terminated C array from owned CStrings (the CStrings must outlive it).
 fn null_terminated(v: &[CString]) -> Vec<*const libc::c_char> {
-    v.iter().map(|c| c.as_ptr()).chain(std::iter::once(std::ptr::null())).collect()
+    v.iter()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect()
 }
 
 /// Exec the stage2 payload from a sealed, anonymous memfd (nothing on any named path):
@@ -619,7 +668,10 @@ fn execute_binary(data: &[u8], args: &[String], json_config: &[u8]) -> Result<()
             libc::AT_EMPTY_PATH,
         );
     }
-    Err(anyhow!("execveat stage2 failed: {}", io::Error::last_os_error()))
+    Err(anyhow!(
+        "execveat stage2 failed: {}",
+        io::Error::last_os_error()
+    ))
 }
 
 #[cfg(test)]
@@ -656,9 +708,16 @@ mod tests {
     /// On a genuine leaf conflict the manifest (overlay) wins.
     #[test]
     fn manifest_wins_on_conflict() {
-        let mut base = json!({ "_stage2": { "x86_64": { "payload": { "args": ["operator"] } } }, "keep": 1 });
-        deep_merge(&mut base, &json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } } }));
-        assert_eq!(base, json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } }, "keep": 1 }));
+        let mut base =
+            json!({ "_stage2": { "x86_64": { "payload": { "args": ["operator"] } } }, "keep": 1 });
+        deep_merge(
+            &mut base,
+            &json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } } }),
+        );
+        assert_eq!(
+            base,
+            json!({ "_stage2": { "x86_64": { "payload": { "args": ["release"] } } }, "keep": 1 })
+        );
     }
 
     /// The verifier stamps the authoritative chain over the arch entry (overwriting any value a

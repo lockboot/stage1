@@ -24,9 +24,9 @@ pub struct Section<'a> {
 }
 
 struct PeView {
-    pe_off: usize,       // offset of "PE\0\0"
-    opt_off: usize,      // offset of the optional header
-    sect_table: usize,   // offset of the first section header
+    pe_off: usize,     // offset of "PE\0\0"
+    opt_off: usize,    // offset of the optional header
+    sect_table: usize, // offset of the first section header
     num_sections: usize,
     section_align: u32,
     file_align: u32,
@@ -55,14 +55,20 @@ impl PeView {
     fn parse(b: &[u8]) -> Result<PeView> {
         ensure!(b.len() > 0x40 && &b[0..2] == b"MZ", "not a PE/MZ image");
         let pe_off = rd_u32(b, 0x3c) as usize;
-        ensure!(pe_off + 24 <= b.len() && &b[pe_off..pe_off + 4] == b"PE\0\0", "bad PE signature");
+        ensure!(
+            pe_off + 24 <= b.len() && &b[pe_off..pe_off + 4] == b"PE\0\0",
+            "bad PE signature"
+        );
         let coff = pe_off + 4;
         let num_sections = rd_u16(b, coff + 2) as usize;
         let size_opt = rd_u16(b, coff + 16) as usize;
         let opt_off = coff + 20;
         // PE32+ (0x20b) is what UEFI images use; the field offsets below assume it.
         let magic = rd_u16(b, opt_off);
-        ensure!(magic == 0x20b, "expected PE32+ image (magic 0x20b), got {magic:#x}");
+        ensure!(
+            magic == 0x20b,
+            "expected PE32+ image (magic 0x20b), got {magic:#x}"
+        );
         let section_align = rd_u32(b, opt_off + 32);
         let file_align = rd_u32(b, opt_off + 36);
         let size_of_headers = rd_u32(b, opt_off + 60);
@@ -125,7 +131,11 @@ pub fn build(stub: &[u8], sections: &[Section]) -> Result<Vec<u8>> {
 
     for s in sections {
         let name_bytes = s.name.as_bytes();
-        ensure!(name_bytes.len() <= 8, "section name {:?} exceeds 8 bytes", s.name);
+        ensure!(
+            name_bytes.len() <= 8,
+            "section name {:?} exceeds 8 bytes",
+            s.name
+        );
 
         // Append raw data at an aligned file offset.
         let raw_ptr = align_up(out.len() as u64, file_align);
@@ -140,8 +150,12 @@ pub fn build(stub: &[u8], sections: &[Section]) -> Result<Vec<u8>> {
         wr_u32(&mut sh, 12, vma as u32); // VirtualAddress
         wr_u32(&mut sh, 16, raw_size as u32); // SizeOfRawData
         wr_u32(&mut sh, 20, raw_ptr as u32); // PointerToRawData
-        // PointerToRelocations/Linenumbers + counts stay 0.
-        wr_u32(&mut sh, 36, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+                                             // PointerToRelocations/Linenumbers + counts stay 0.
+        wr_u32(
+            &mut sh,
+            36,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+        );
         headers.push(sh);
 
         vma = align_up(vma + s.data.len() as u64, section_align);

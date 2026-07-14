@@ -12,7 +12,17 @@ on:
   workflow_dispatch:
 
 jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: CI (fmt-check + clippy + test)
+        run: make ci
+
   build:
+    name: build-${{ matrix.arch }}
+    needs: ci
     runs-on: ubuntu-latest
     strategy:
       matrix:

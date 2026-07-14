@@ -112,8 +112,13 @@ fn main() -> Result<()> {
     // --- os-release (.osrel) ---
     let osrel = match &args.os_release {
         Some(p) => std::fs::read(p).with_context(|| format!("reading {}", p.display()))?,
-        None => generate_os_release(&args.id, &kernel, args.cmdline.as_bytes(), &initrd.layer_hashes)
-            .into_bytes(),
+        None => generate_os_release(
+            &args.id,
+            &kernel,
+            args.cmdline.as_bytes(),
+            &initrd.layer_hashes,
+        )
+        .into_bytes(),
     };
 
     // --- assemble UKI ---
@@ -164,7 +169,9 @@ fn resolve_layers(args: &Args) -> Result<Vec<Layer>> {
         // os-release stays byte-identical to the pre-layering output.
         Ok(vec![Layer::new("rootfs", LayerSource::from_path(rootfs)?)])
     } else {
-        bail!("provide --layer <dir|tar> (repeatable), --rootfs <dir|tar>, or --from-docker <image>");
+        bail!(
+            "provide --layer <dir|tar> (repeatable), --rootfs <dir|tar>, or --from-docker <image>"
+        );
     }
 }
 

@@ -42,6 +42,16 @@ docker-shell-base: docker-build-base
 docker-clean:
 	docker rmi $(BUILD_IMAGE) || true
 
+# ---- CI gate: fmt + clippy + unit tests across the workspace (what the branch ruleset requires) ----
+.PHONY: ci fmt-fix
+ci: docker-build-base
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) bash -c "\
+		cargo fmt --all --check && \
+		cargo clippy --workspace --all-targets --locked -- -D warnings && \
+		cargo test --workspace --locked"
+fmt-fix: docker-build-base ## Apply rustfmt across the whole workspace (no --check)
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) cargo fmt --all
+
 
 #####################################################################
 # UKI build (stage0 serves linux.efi over the network and admits it by
