@@ -90,8 +90,10 @@ pub fn verify(
     let key_bytes = STANDARD
         .decode(pubkey_b64.trim())
         .map_err(|_| "ed25519 pubkey is not valid base64")?;
-    let public_key = PublicKey::from_slice(&key_bytes).map_err(|_| "ed25519 pubkey wrong length")?;
-    let signature = Signature::from_slice(signature).map_err(|_| "ed25519 signature wrong length")?;
+    let public_key =
+        PublicKey::from_slice(&key_bytes).map_err(|_| "ed25519 pubkey wrong length")?;
+    let signature =
+        Signature::from_slice(signature).map_err(|_| "ed25519 signature wrong length")?;
     public_key
         .verify(preimage(domain, message), &signature)
         .map_err(|_| "ed25519 signature verification failed")
@@ -177,7 +179,13 @@ mod tests {
         let msg = b"payload bytes";
         let s = sign(&pem_from_seed(&[7u8; 32]), Domain::Stage2Payload, msg).unwrap();
         assert!(verify(&s.pubkey_b64, Domain::Stage2Payload, msg, &s.signature).is_ok());
-        assert!(verify(&s.pubkey_b64, Domain::Stage2Payload, b"tampered!!!!!", &s.signature).is_err());
+        assert!(verify(
+            &s.pubkey_b64,
+            Domain::Stage2Payload,
+            b"tampered!!!!!",
+            &s.signature
+        )
+        .is_err());
         let mut bad = s.signature.clone();
         bad[0] ^= 1;
         assert!(verify(&s.pubkey_b64, Domain::Stage2Payload, msg, &bad).is_err());
@@ -199,13 +207,24 @@ mod tests {
     /// this fails. Values are base64.
     #[test]
     fn golden_kat() {
-        let s = sign(&pem_from_seed(&[7u8; 32]), Domain::Stage1Manifest, b"lockboot-kat").unwrap();
+        let s = sign(
+            &pem_from_seed(&[7u8; 32]),
+            Domain::Stage1Manifest,
+            b"lockboot-kat",
+        )
+        .unwrap();
         assert_eq!(s.pubkey_b64, "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=");
         assert_eq!(
             STANDARD.encode(&s.signature),
             "nVZgjXp9d4zjnj9axtTQALlMADGqGKPTnR6RjMr8h8nI3wNpsBy0M4ZBjVfjlLKRZTN0pH3AAsGJqU0tJRTQDA=="
         );
-        assert!(verify(&s.pubkey_b64, Domain::Stage1Manifest, b"lockboot-kat", &s.signature).is_ok());
+        assert!(verify(
+            &s.pubkey_b64,
+            Domain::Stage1Manifest,
+            b"lockboot-kat",
+            &s.signature
+        )
+        .is_ok());
     }
 
     #[test]

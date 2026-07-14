@@ -206,15 +206,29 @@ impl Payload {
     pub fn admission(&self, profile: Profile) -> Result<Admit, &'static str> {
         let allow_https = matches!(profile, Profile::Stage1);
         if !ok_list(&self.url, allow_https) {
-            return Err("url must be a non-empty http(s):// URL (or list of them), printable ASCII");
+            return Err(
+                "url must be a non-empty http(s):// URL (or list of them), printable ASCII",
+            );
         }
-        if self.sig_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+        if self
+            .sig_url
+            .as_ref()
+            .is_some_and(|l| !ok_list(l, allow_https))
+        {
             return Err("sig_url must be http(s):// URL(s), printable ASCII");
         }
-        if self.args_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+        if self
+            .args_url
+            .as_ref()
+            .is_some_and(|l| !ok_list(l, allow_https))
+        {
             return Err("args_url must be http(s):// URL(s), printable ASCII");
         }
-        if self.args_sig_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+        if self
+            .args_sig_url
+            .as_ref()
+            .is_some_and(|l| !ok_list(l, allow_https))
+        {
             return Err("args_sig_url must be http(s):// URL(s), printable ASCII");
         }
         if self.args_sig_url.is_some() && self.args_url.is_none() {
@@ -251,9 +265,15 @@ impl ManifestRef {
     pub fn validate(&self, profile: Profile) -> Result<(), &'static str> {
         let allow_https = matches!(profile, Profile::Stage1);
         if !ok_list(&self.url, allow_https) {
-            return Err("manifest url must be a non-empty http(s):// URL (or list), printable ASCII");
+            return Err(
+                "manifest url must be a non-empty http(s):// URL (or list), printable ASCII",
+            );
         }
-        if self.sig_url.as_ref().is_some_and(|l| !ok_list(l, allow_https)) {
+        if self
+            .sig_url
+            .as_ref()
+            .is_some_and(|l| !ok_list(l, allow_https))
+        {
             return Err("manifest sig_url must be http(s):// URL(s), printable ASCII");
         }
         if self.sha256.as_ref().is_some_and(|h| !ok_sha256(h)) {
@@ -289,49 +309,75 @@ mod tests {
 
     #[test]
     fn sha256_mode_ok() {
-        assert!(matches!(payload("http://h/p", Some(HASH64), None).admission(Profile::Stage1), Ok(Admit::Sha256(_))));
+        assert!(matches!(
+            payload("http://h/p", Some(HASH64), None).admission(Profile::Stage1),
+            Ok(Admit::Sha256(_))
+        ));
     }
 
     #[test]
     fn https_allowed_on_stage1_only() {
-        assert!(payload("https://h/p", Some(HASH64), None).admission(Profile::Stage1).is_ok());
-        assert!(payload("https://h/p", Some(HASH64), None).admission(Profile::Stage0).is_err());
-        assert!(payload("http://h/p", Some(HASH64), None).admission(Profile::Stage0).is_ok());
+        assert!(payload("https://h/p", Some(HASH64), None)
+            .admission(Profile::Stage1)
+            .is_ok());
+        assert!(payload("https://h/p", Some(HASH64), None)
+            .admission(Profile::Stage0)
+            .is_err());
+        assert!(payload("http://h/p", Some(HASH64), None)
+            .admission(Profile::Stage0)
+            .is_ok());
     }
 
     #[test]
     fn ed25519_mode_ok() {
         let pk = pubkey_b64();
-        assert!(matches!(payload("http://h/p", None, Some(&pk)).admission(Profile::Stage1), Ok(Admit::Ed25519 { .. })));
+        assert!(matches!(
+            payload("http://h/p", None, Some(&pk)).admission(Profile::Stage1),
+            Ok(Admit::Ed25519 { .. })
+        ));
     }
 
     #[test]
     fn both_modes_is_error() {
         let pk = pubkey_b64();
-        assert!(payload("http://h/p", Some(HASH64), Some(&pk)).admission(Profile::Stage1).is_err());
+        assert!(payload("http://h/p", Some(HASH64), Some(&pk))
+            .admission(Profile::Stage1)
+            .is_err());
     }
 
     #[test]
     fn neither_mode_is_error() {
-        assert!(payload("http://h/p", None, None).admission(Profile::Stage1).is_err());
+        assert!(payload("http://h/p", None, None)
+            .admission(Profile::Stage1)
+            .is_err());
     }
 
     #[test]
     fn bad_hex_is_error() {
-        assert!(payload("http://h/p", Some("zz"), None).admission(Profile::Stage1).is_err());
+        assert!(payload("http://h/p", Some("zz"), None)
+            .admission(Profile::Stage1)
+            .is_err());
         let sixtyfour_nonhex = "z".repeat(64);
-        assert!(payload("http://h/p", Some(&sixtyfour_nonhex), None).admission(Profile::Stage1).is_err());
+        assert!(payload("http://h/p", Some(&sixtyfour_nonhex), None)
+            .admission(Profile::Stage1)
+            .is_err());
     }
 
     #[test]
     fn bad_pubkey_is_error() {
-        assert!(payload("http://h/p", None, Some("not-base64!!")).admission(Profile::Stage1).is_err());
-        assert!(payload("http://h/p", None, Some("AAAA")).admission(Profile::Stage1).is_err());
+        assert!(payload("http://h/p", None, Some("not-base64!!"))
+            .admission(Profile::Stage1)
+            .is_err());
+        assert!(payload("http://h/p", None, Some("AAAA"))
+            .admission(Profile::Stage1)
+            .is_err());
     }
 
     #[test]
     fn non_http_url_is_error() {
-        assert!(payload("ftp://h/p", Some(HASH64), None).admission(Profile::Stage1).is_err());
+        assert!(payload("ftp://h/p", Some(HASH64), None)
+            .admission(Profile::Stage1)
+            .is_err());
     }
 
     #[test]
@@ -352,7 +398,12 @@ mod tests {
     #[test]
     fn manifest_validate_ok_and_errors() {
         let pk = pubkey_b64();
-        let mut m = ManifestRef { url: UrlList(vec!["http://h/m".into()]), ed25519: pk, sig_url: None, sha256: None };
+        let mut m = ManifestRef {
+            url: UrlList(vec!["http://h/m".into()]),
+            ed25519: pk,
+            sig_url: None,
+            sha256: None,
+        };
         assert!(m.validate(Profile::Stage1).is_ok());
         // optional sha256 pin is checked
         m.sha256 = Some("nope".into());
@@ -369,9 +420,15 @@ mod tests {
         let one: UrlList = serde_json::from_str(r#""http://a/x""#).unwrap();
         assert_eq!(one.0, vec!["http://a/x".to_string()]);
         let many: UrlList = serde_json::from_str(r#"["http://a/x","http://b/x"]"#).unwrap();
-        assert_eq!(many.0, vec!["http://a/x".to_string(), "http://b/x".to_string()]);
+        assert_eq!(
+            many.0,
+            vec!["http://a/x".to_string(), "http://b/x".to_string()]
+        );
         assert_eq!(serde_json::to_string(&one).unwrap(), r#""http://a/x""#);
-        assert_eq!(serde_json::to_string(&many).unwrap(), r#"["http://a/x","http://b/x"]"#);
+        assert_eq!(
+            serde_json::to_string(&many).unwrap(),
+            r#"["http://a/x","http://b/x"]"#
+        );
     }
 
     // --- Discriminated-union wire representation (the serde-flatten round-trip risk) ---
@@ -412,9 +469,15 @@ mod tests {
     #[test]
     fn arch_validate_dispatches_on_variant() {
         let pk = pubkey_b64();
-        let p: ArchConfig = serde_json::from_str(&format!(r#"{{"payload":{{"url":"http://h/p","sha256":"{HASH64}"}}}}"#)).unwrap();
+        let p: ArchConfig = serde_json::from_str(&format!(
+            r#"{{"payload":{{"url":"http://h/p","sha256":"{HASH64}"}}}}"#
+        ))
+        .unwrap();
         assert!(p.validate(Profile::Stage1).is_ok());
-        let m: ArchConfig = serde_json::from_str(&format!(r#"{{"manifest":{{"url":"http://h/m","ed25519":"{pk}"}}}}"#)).unwrap();
+        let m: ArchConfig = serde_json::from_str(&format!(
+            r#"{{"manifest":{{"url":"http://h/m","ed25519":"{pk}"}}}}"#
+        ))
+        .unwrap();
         assert!(m.validate(Profile::Stage1).is_ok());
     }
 }

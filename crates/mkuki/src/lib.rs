@@ -45,8 +45,8 @@ impl LayerSource {
         if path.is_dir() {
             return Ok(LayerSource::Dir(path.to_path_buf()));
         }
-        let raw = std::fs::read(path)
-            .with_context(|| format!("reading layer {}", path.display()))?;
+        let raw =
+            std::fs::read(path).with_context(|| format!("reading layer {}", path.display()))?;
         if raw.starts_with(&[0x1f, 0x8b]) {
             let mut dec = flate2::read::GzDecoder::new(&raw[..]);
             let mut tar = Vec::new();
@@ -68,7 +68,10 @@ pub struct Layer {
 
 impl Layer {
     pub fn new(label: impl Into<String>, source: LayerSource) -> Self {
-        Layer { label: label.into(), source }
+        Layer {
+            label: label.into(),
+            source,
+        }
     }
 
     /// Build a layer from a path, deriving the label from the file name (up to the
@@ -128,14 +131,29 @@ pub struct UkiSpec<'a> {
 pub fn assemble(spec: &UkiSpec) -> Result<Vec<u8>> {
     info!("assembling UKI");
     let mut sections = vec![
-        uki::Section { name: ".osrel", data: spec.os_release },
-        uki::Section { name: ".cmdline", data: spec.cmdline },
+        uki::Section {
+            name: ".osrel",
+            data: spec.os_release,
+        },
+        uki::Section {
+            name: ".cmdline",
+            data: spec.cmdline,
+        },
     ];
     if let Some(u) = spec.uname {
-        sections.push(uki::Section { name: ".uname", data: u.as_bytes() });
+        sections.push(uki::Section {
+            name: ".uname",
+            data: u.as_bytes(),
+        });
     }
-    sections.push(uki::Section { name: ".linux", data: spec.kernel });
-    sections.push(uki::Section { name: ".initrd", data: spec.initrd });
+    sections.push(uki::Section {
+        name: ".linux",
+        data: spec.kernel,
+    });
+    sections.push(uki::Section {
+        name: ".initrd",
+        data: spec.initrd,
+    });
     uki::build(spec.stub, &sections)
 }
 
@@ -153,7 +171,13 @@ fn build_layer(src: &LayerSource) -> Result<Vec<u8>> {
 /// `.`, falling back to "layer".
 fn layer_label(p: &Path) -> String {
     p.file_name()
-        .map(|s| s.to_string_lossy().split('.').next().unwrap_or("layer").to_string())
+        .map(|s| {
+            s.to_string_lossy()
+                .split('.')
+                .next()
+                .unwrap_or("layer")
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "layer".to_string())
 }
@@ -167,7 +191,10 @@ pub fn docker_export(engine: &str, image: &str) -> Result<Vec<u8>> {
         .output()
         .with_context(|| format!("running `{engine} create`"))?;
     if !create.status.success() {
-        bail!("`{engine} create {image}` failed: {}", String::from_utf8_lossy(&create.stderr));
+        bail!(
+            "`{engine} create {image}` failed: {}",
+            String::from_utf8_lossy(&create.stderr)
+        );
     }
     let cid = String::from_utf8(create.stdout)?.trim().to_string();
 
@@ -180,7 +207,10 @@ pub fn docker_export(engine: &str, image: &str) -> Result<Vec<u8>> {
     let _ = Command::new(engine).args(["rm", "-f", &cid]).output();
 
     if !export.status.success() {
-        bail!("`{engine} export {cid}` failed: {}", String::from_utf8_lossy(&export.stderr));
+        bail!(
+            "`{engine} export {cid}` failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        );
     }
     Ok(export.stdout)
 }
@@ -214,7 +244,5 @@ pub fn generate_os_release(
         short_d(cmdline),
         initrd,
     );
-    format!(
-        "ID={id}\nNAME=\"{id}\"\nPRETTY_NAME=\"{id}\"\nBUILD_ID={build_id}\n"
-    )
+    format!("ID={id}\nNAME=\"{id}\"\nPRETTY_NAME=\"{id}\"\nBUILD_ID={build_id}\n")
 }

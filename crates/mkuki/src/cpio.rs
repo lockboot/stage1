@@ -47,8 +47,8 @@ impl CpioBuilder {
 
     /// Ingest a flat root filesystem from a directory tree.
     pub fn add_dir(&mut self, root: &Path) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::MetadataExt;
 
         for dent in WalkDir::new(root).min_depth(1).sort_by_file_name() {
             let dent = dent?;
@@ -63,7 +63,12 @@ impl CpioBuilder {
 
             let entry = if ft.is_symlink() {
                 let target = std::fs::read_link(dent.path())?;
-                Entry::new(name, S_IFLNK | 0o777, 1, target.to_string_lossy().as_bytes().to_vec())
+                Entry::new(
+                    name,
+                    S_IFLNK | 0o777,
+                    1,
+                    target.to_string_lossy().as_bytes().to_vec(),
+                )
             } else if ft.is_dir() {
                 Entry::new(name, S_IFDIR | perms, 2, Vec::new())
             } else if ft.is_file() {
@@ -173,18 +178,39 @@ impl CpioBuilder {
 
 impl Entry {
     fn new(name: String, mode: u32, nlink: u32, data: Vec<u8>) -> Self {
-        Entry { name, mode, nlink, rdevmajor: 0, rdevminor: 0, data }
+        Entry {
+            name,
+            mode,
+            nlink,
+            rdevmajor: 0,
+            rdevminor: 0,
+            data,
+        }
     }
 
     fn dev(name: String, mode: u32, rdev: u64) -> Self {
         // Linux dev_t encoding (glibc gnu_dev_major/minor).
         let major = (((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfffu64)) as u32;
         let minor = ((rdev & 0xff) | ((rdev >> 12) & !0xffu64)) as u32;
-        Entry { name, mode, nlink: 1, rdevmajor: major, rdevminor: minor, data: Vec::new() }
+        Entry {
+            name,
+            mode,
+            nlink: 1,
+            rdevmajor: major,
+            rdevminor: minor,
+            data: Vec::new(),
+        }
     }
 
     fn dev_split(name: String, mode: u32, major: u32, minor: u32) -> Self {
-        Entry { name, mode, nlink: 1, rdevmajor: major, rdevminor: minor, data: Vec::new() }
+        Entry {
+            name,
+            mode,
+            nlink: 1,
+            rdevmajor: major,
+            rdevminor: minor,
+            data: Vec::new(),
+        }
     }
 
     fn write(&self, out: &mut Vec<u8>, ino: u32) -> Result<()> {
@@ -259,7 +285,9 @@ pub fn gzip(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::{Compression, GzBuilder};
     let mut buf = Vec::new();
     {
-        let mut enc = GzBuilder::new().mtime(0).write(&mut buf, Compression::best());
+        let mut enc = GzBuilder::new()
+            .mtime(0)
+            .write(&mut buf, Compression::best());
         enc.write_all(data)?;
         enc.finish()?;
     }
