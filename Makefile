@@ -19,9 +19,9 @@ ARCHS = x86_64 aarch64
 .PHONY: build
 build: $(ARCHS)
 
-.PHONY: amd64 x86_64 arm64 aarch64
-amd64 x86_64: tools/build-uki/x86_64/linux.efi
-arm64 aarch64: tools/build-uki/aarch64/linux.efi
+.PHONY: build-amd64 build-x86_64 build-arm64 build-aarch64 amd64 x86_64 arm64 aarch64
+build-amd64 build-x86_64 amd64 x86_64: tools/build-uki/x86_64/linux.efi
+build-arm64 build-aarch64 arm64 aarch64: tools/build-uki/aarch64/linux.efi
 
 # Reference production _stage1/_stage2 doc (served from S3 in prod).
 DEFAULT_STAGE2_URL = https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.json
@@ -86,7 +86,7 @@ tools/build-uki/%/linux.efi: tools/build-uki/%/busybox tools/build-uki/%/stage1 
 tools/build-uki/%/stage1: docker-build-base
 	mkdir -p tools/build-uki/$*
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --workspace --exclude mkuki --exclude deploy --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
+		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --workspace --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
 
 # mkuki assembles the UKI from inside build.sh. Unlike stage1 (which runs on the
 # target arch), mkuki is a build-host tool that runs in the x86_64 build container
