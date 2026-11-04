@@ -108,7 +108,7 @@ update-fedora-deps: docker-build-base
 
 
 #####################################################################
-# Runtime container image (busybox + stage1) -> ghcr on uki-v* tags.
+# Runtime container image (busybox + stage1) -> ghcr on v* release tags.
 
 docker-buildx-setup:
 	docker buildx create --name lockboot-builder --use || docker buildx use lockboot-builder

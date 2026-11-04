@@ -10,9 +10,9 @@
 # Usage: ./publish.sh <dest-uri> <arch> [version]
 #   dest-uri : s3://bucket/prefix   or   gs://bucket/prefix
 #   arch     : x86_64 | aarch64
-#   version  : a uki-v* release tag, or 'local' (default) to use a local build
+#   version  : a v* release tag, or 'local' (default) to use a local build
 #
-# Example: ./publish.sh s3://lockboot/uki x86_64 uki-v0.1.0
+# Example: ./publish.sh s3://lockboot/uki x86_64 v0.3.0
 #          ./publish.sh gs://lockboot/uki aarch64 local
 
 set -euo pipefail
@@ -30,7 +30,7 @@ if [ "${ARCH}" != "x86_64" ] && [ "${ARCH}" != "aarch64" ]; then
     echo "Error: arch must be x86_64 or aarch64"; exit 1
 fi
 
-# Resolve the UKI: local build, or a verified uki-v* release artifact.
+# Resolve the UKI: local build, or a verified v* release artifact.
 if [ "${VERSION}" != "local" ]; then
     TEMP_DIR=$(mktemp -d); trap "rm -rf ${TEMP_DIR}" EXIT
     GH_REPO=$(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\.git/\1/' || echo "")
