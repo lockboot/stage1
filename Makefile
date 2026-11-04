@@ -269,7 +269,8 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \
 			--boot-disk "$(STAGE0_BOOT_DISK)" \
-			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace)
+			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace) \
+			$(if $(HARNESS_TIMEOUT),--timeout $(HARNESS_TIMEOUT))
 
 # ---- Smoke test: _stage2 args actually reach the payload's argv ----
 # Boot the full chain with a known inline args array (one arg contains a space, to prove
@@ -286,6 +287,40 @@ smoke-args-%:
 		echo "FAIL: expected 'arg[1]: --smoke' and 'arg[2]: hello world' in the console output"; \
 		exit 1; \
 	fi
+
+
+# ---- Self-test: stage1's part of the workspace `make selftest` (PASS/FAIL, non-zero on FAIL) ----
+# Boots the full chain (stage0 -> UKI -> stage1 -> example-stage2) in every _stage2 admission mode,
+# then smoke-args. A mode PASSes only if the leaf actually ran (its argv echo + "Task complete")
+# AND stage1 handed it an attestation (no "Error reading /tmp/stage1.attest"). Every boot is
+# time-bounded (HARNESS_TIMEOUT -> qemu-test.sh --timeout), one bound for both arches.
+# Needs the sibling stage0 boot.disk and the lockboot:harness image (stage0 `make selftest-<arch>`).
+SELFTEST_TIMEOUT_x86_64  ?= 300
+SELFTEST_TIMEOUT_aarch64 ?= 300
+.PHONY: selftest
+selftest:
+	@echo "needs an arch suffix, e.g. 'make selftest-x86_64'." >&2; exit 2
+selftest-%:
+	@fail=0; T=$(SELFTEST_TIMEOUT_$*); sum="build/$*/selftest.summary"; mkdir -p build/$*; : > "$$sum"; \
+	for m in "sha256:" "sign:SIGN=1" "sign_args:SIGN=1 SIGN_ARGS=1" "manifest:SIGN=1 MANIFEST=1" "fallback:FALLBACK=1"; do \
+		name="$${m%%:*}"; vars="$${m#*:}"; log="build/$*/selftest-$$name.log"; \
+		echo "==================== stage1 chain test [$$name] $$vars -> $$log"; \
+		$(MAKE) --no-print-directory test-chain-$* $$vars HARNESS_TIMEOUT=$$T > "$$log" 2>&1 || true; \
+		if grep -q 'arg\[0\]:' "$$log" && grep -q '=== Task complete' "$$log" \
+		   && ! grep -q 'Error reading /tmp/stage1.attest' "$$log"; then \
+			echo "PASS [$$name]" | tee -a "$$sum"; \
+		else \
+			echo "FAIL [$$name] (see $$log)" | tee -a "$$sum"; fail=1; \
+		fi; \
+	done; \
+	echo "==================== stage1 smoke-args"; \
+	if $(MAKE) --no-print-directory smoke-args-$* HARNESS_TIMEOUT=$$T > build/$*/selftest-smoke-args.log 2>&1; then \
+		echo "PASS [smoke-args]" | tee -a "$$sum"; \
+	else \
+		echo "FAIL [smoke-args] (see build/$*/selftest-smoke-args.log)" | tee -a "$$sum"; fail=1; \
+	fi; \
+	echo "==================== stage1 self-test summary ($*)"; cat "$$sum"; \
+	if [ "$$fail" = 0 ]; then echo "ALL STAGE1 SELF-TESTS PASSED ($*)"; else echo "SOME STAGE1 SELF-TESTS FAILED ($*)"; exit 1; fi
 
 
 #####################################################################
