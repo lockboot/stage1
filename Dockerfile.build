@@ -22,7 +22,6 @@ RUN apt-get -qq update && \
     openssl \
     ovmf \
     python3 \
-    python3-pip \
     qemu-efi-aarch64 \
     rpm \
     rpm2cpio \
@@ -30,8 +29,7 @@ RUN apt-get -qq update && \
     util-linux \
     uuid-runtime \
     wget \
-    xz-utils && \
-    pip3 install --break-system-packages virt-firmware
+    xz-utils
 
 # Reproducible builds environment
 ENV SOURCE_DATE_EPOCH=0
