@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
     # Release track gated by tag prefix:
-    #   uki-v*  → the netboot UKI (stage1), admitted by stage0 via sha256 + PCR 14
-    # (The Secure Boot root of trust ships from the stage0 repo on its own stage0-v* track.)
-    tags: ['uki-v*']
+    #   v*  → the netboot UKI (stage1), admitted by stage0 via sha256 + PCR 14
+    # (The Secure Boot root of trust ships from the stage0 repo, on its own v* releases.)
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -50,17 +50,18 @@ jobs:
           path: |
             tools/build-uki/${{ matrix.arch }}/linux.efi
             tools/build-uki/${{ matrix.arch }}/linux.efi.sha256
+            tools/build-uki/${{ matrix.arch }}/measurements.json
             tools/build-uki/${{ matrix.arch }}/stage0-snippet.json
             tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/busybox
             tools/build-uki/${{ matrix.arch }}/stage1
             build/${{ matrix.arch }}/stage2
 
-  # ---- UKI (stage1) release track (tag: uki-v*) ----------------------------
+  # ---- UKI (stage1) release track (tag: v*) ----------------------------
   release-uki:
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/uki-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       id-token: write
@@ -77,12 +78,26 @@ jobs:
             gh api repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip > uki-${arch}.zip
           done
 
-      - name: Attest UKI zips
+      # One attestation covering the release zips and every file inside them. Consumers can verify
+      # a zip and extract from it, or verify an extracted file on its own (e.g. the linux.efi stage0
+      # admits by sha256: `gh attestation verify linux.efi --repo ...`). Subjects are named via a
+      # checksums file so the per-arch copies of same-named files stay distinguishable
+      # (x86_64/... vs aarch64/...); verification itself matches by digest.
+      - name: List attestation subjects (zips + their contents)
+        run: |
+          for arch in x86_64 aarch64; do
+            mkdir -p "contents/$arch" && unzip -q "uki-$arch.zip" -d "contents/$arch"
+          done
+          {
+            sha256sum uki-x86_64.zip uki-aarch64.zip
+            (cd contents && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum)
+          } > subjects.sha256
+          cat subjects.sha256
+
+      - name: Attest UKI zips and their contents
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
-          subject-path: |
-            uki-x86_64.zip
-            uki-aarch64.zip
+          subject-checksums: subjects.sha256
 
       - name: Create UKI release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
@@ -96,12 +111,12 @@ jobs:
           generate_release_notes: true
           make_latest: true
 
-  # ---- stage1 runtime container image (tag: uki-v*) ------------------------
+  # ---- stage1 runtime container image (tag: v*) ------------------------
   # Minimal busybox + stage1 utility image; belongs to the stage1/UKI track.
   release-docker:
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/uki-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       packages: write

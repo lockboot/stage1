@@ -8,7 +8,8 @@ log()  { kmsg "<6>init: $*"; }
 warn() { kmsg "<4>init: $*"; }
 die()  { kmsg "<3>init: $*"; $BB poweroff -f; }
 
-# sysctl path value — write or die. Pass -f to skip missing files with a warning.
+# sysctl path value — write or die. Pass -f to skip (with a warning) a knob that is
+# missing OR present-but-unwritable on this arch (e.g. nmi_watchdog on aarch64).
 sysctl() {
 	_opt=0; [ "${1:-}" = "-f" ] && { _opt=1; shift; }
 	_path="/proc/sys/$1"; _name=$(echo "$1" | $BB tr '/' '.')
@@ -17,6 +18,7 @@ sysctl() {
 		die "sysctl: $_name not found"
 	fi
 	if ! echo "$2" > "$_path" 2>/dev/null; then
+		[ $_opt -eq 1 ] && { warn "sysctl: $_name=$2 skipped (write failed)"; return 0; }
 		die "sysctl: $_name=$2 failed"
 	fi
 	log "sysctl: $_name=$2"
@@ -110,7 +112,7 @@ sysctl net/core/bpf_jit_harden 2
 # Fail closed: crash immediately on abnormal conditions rather than continuing
 # in a potentially exploitable state. crashkernel=0 + lockdown ensures no
 # memory dump is produced on panic.
-sysctl kernel/nmi_watchdog 0
+sysctl -f kernel/nmi_watchdog 0   # present but not writable on aarch64 (no NMI watchdog)
 sysctl kernel/panic_on_oops 1
 sysctl kernel/softlockup_panic 1
 sysctl -f kernel/hung_task_panic 1

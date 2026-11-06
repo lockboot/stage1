@@ -301,6 +301,11 @@ cp "${KERNEL_PATH}" "${OUTPUT_DIR}/vmlinuz-${KERNEL_VERSION}"
 UKI_SHA256=$(sha256sum "${UKI_PATH}" | cut -d' ' -f1)
 echo "${UKI_SHA256}  linux.efi" > "${OUTPUT_DIR}/linux.efi.sha256"
 
+# stage1's fixed PCR contribution (PCR5/9/11 extends, per bank), reproduced from linux.efi alone:
+# what a verifier appends to stage0's pcrs.json (see tools/predict-pcrs.py).
+python3 "${SCRIPT_DIR}/../predict-pcrs.py" --uki "${UKI_PATH}" --emit-measurements \
+    --out "${OUTPUT_DIR}/measurements.json"
+
 # Ready-to-paste _stage1 user-data snippet (sha256 admission mode). Deployers who
 # want signed-mode rollforward re-sign linux.efi with their own ed25519 key.
 cat > "${OUTPUT_DIR}/stage0-snippet.json" <<SNIPPET

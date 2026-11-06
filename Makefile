@@ -19,9 +19,9 @@ ARCHS = x86_64 aarch64
 .PHONY: build
 build: $(ARCHS)
 
-.PHONY: amd64 x86_64 arm64 aarch64
-amd64 x86_64: tools/build-uki/x86_64/linux.efi
-arm64 aarch64: tools/build-uki/aarch64/linux.efi
+.PHONY: build-amd64 build-x86_64 build-arm64 build-aarch64 amd64 x86_64 arm64 aarch64
+build-amd64 build-x86_64 amd64 x86_64: tools/build-uki/x86_64/linux.efi
+build-arm64 build-aarch64 arm64 aarch64: tools/build-uki/aarch64/linux.efi
 
 # Reference production _stage1/_stage2 doc (served from S3 in prod).
 DEFAULT_STAGE2_URL = https://lockboot.s3.us-east-1.amazonaws.com/examples/stage2/user-data.json
@@ -80,13 +80,14 @@ tools/build-uki/%/linux.efi: tools/build-uki/%/busybox tools/build-uki/%/stage1 
 
 # Build AND extract stage1 inside the one container step, so the cp runs where
 # target/ exists rather than in the host/make context, which may not see the build
-# container's target dir under nested docker (e.g. `act`). --exclude mkuki/deploy: they
-# are build-host tools (mkuki assembles the UKI; deploy generates deployment config), so
-# they must not be cross-compiled for the payload target $* here.
+# container's target dir under nested docker (e.g. `act`). `-p stage1` only, in its own cargo
+# invocation: resolver 2 unifies the features of shared dependencies across every package built
+# together for a target, so building the host tools (mkuki, deploy) or anything else alongside
+# would let their dependency features leak into the measured stage1 binary inside the UKI.
 tools/build-uki/%/stage1: docker-build-base
 	mkdir -p tools/build-uki/$*
 	$(DOCKER_RUN) -e ARCH=$* $(DOCKER_SAMEUSER) $(BUILD_IMAGE) \
-		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked --workspace --exclude mkuki --exclude deploy --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
+		bash -c "rustup target add $*-unknown-linux-musl && cargo build --release --locked -p stage1 --target $*-unknown-linux-musl && cp -v target/$*-unknown-linux-musl/release/stage1 $@"
 
 # mkuki assembles the UKI from inside build.sh. Unlike stage1 (which runs on the
 # target arch), mkuki is a build-host tool that runs in the x86_64 build container
@@ -108,7 +109,7 @@ update-fedora-deps: docker-build-base
 
 
 #####################################################################
-# Runtime container image (busybox + stage1) -> ghcr on uki-v* tags.
+# Runtime container image (busybox + stage1) -> ghcr on v* release tags.
 
 docker-buildx-setup:
 	docker buildx create --name lockboot-builder --use || docker buildx use lockboot-builder
@@ -269,7 +270,8 @@ test-chain-%: tools/build-uki/%/linux.efi build/%/stage2 \
 		-e YES_INSIDE_DOCKER_DO_DANGEROUS_IPTABLES=1 --cap-add=NET_ADMIN --device=/dev/net/tun \
 		$(HARNESS_IMAGE) --kind stage0 --arch $* \
 			--boot-disk "$(STAGE0_BOOT_DISK)" \
-			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace)
+			--serve-dir "$$D" --user-data user-data.stage0.json $(if $(TRACE),--trace) \
+			$(if $(HARNESS_TIMEOUT),--timeout $(HARNESS_TIMEOUT))
 
 # ---- Smoke test: _stage2 args actually reach the payload's argv ----
 # Boot the full chain with a known inline args array (one arg contains a space, to prove
@@ -286,6 +288,40 @@ smoke-args-%:
 		echo "FAIL: expected 'arg[1]: --smoke' and 'arg[2]: hello world' in the console output"; \
 		exit 1; \
 	fi
+
+
+# ---- Self-test: stage1's part of the workspace `make selftest` (PASS/FAIL, non-zero on FAIL) ----
+# Boots the full chain (stage0 -> UKI -> stage1 -> example-stage2) in every _stage2 admission mode,
+# then smoke-args. A mode PASSes only if the leaf actually ran (its argv echo + "Task complete")
+# AND stage1 handed it an attestation (no "Error reading /tmp/stage1.attest"). Every boot is
+# time-bounded (HARNESS_TIMEOUT -> qemu-test.sh --timeout), one bound for both arches.
+# Needs the sibling stage0 boot.disk and the lockboot:harness image (stage0 `make selftest-<arch>`).
+SELFTEST_TIMEOUT_x86_64  ?= 300
+SELFTEST_TIMEOUT_aarch64 ?= 300
+.PHONY: selftest
+selftest:
+	@echo "needs an arch suffix, e.g. 'make selftest-x86_64'." >&2; exit 2
+selftest-%:
+	@fail=0; T=$(SELFTEST_TIMEOUT_$*); sum="build/$*/selftest.summary"; mkdir -p build/$*; : > "$$sum"; \
+	for m in "sha256:" "sign:SIGN=1" "sign_args:SIGN=1 SIGN_ARGS=1" "manifest:SIGN=1 MANIFEST=1" "fallback:FALLBACK=1"; do \
+		name="$${m%%:*}"; vars="$${m#*:}"; log="build/$*/selftest-$$name.log"; \
+		echo "==================== stage1 chain test [$$name] $$vars -> $$log"; \
+		$(MAKE) --no-print-directory test-chain-$* $$vars HARNESS_TIMEOUT=$$T > "$$log" 2>&1 || true; \
+		if grep -q 'arg\[0\]:' "$$log" && grep -q '=== Task complete' "$$log" \
+		   && ! grep -q 'Error reading /tmp/stage1.attest' "$$log"; then \
+			echo "PASS [$$name]" | tee -a "$$sum"; \
+		else \
+			echo "FAIL [$$name] (see $$log)" | tee -a "$$sum"; fail=1; \
+		fi; \
+	done; \
+	echo "==================== stage1 smoke-args"; \
+	if $(MAKE) --no-print-directory smoke-args-$* HARNESS_TIMEOUT=$$T > build/$*/selftest-smoke-args.log 2>&1; then \
+		echo "PASS [smoke-args]" | tee -a "$$sum"; \
+	else \
+		echo "FAIL [smoke-args] (see build/$*/selftest-smoke-args.log)" | tee -a "$$sum"; fail=1; \
+	fi; \
+	echo "==================== stage1 self-test summary ($*)"; cat "$$sum"; \
+	if [ "$$fail" = 0 ]; then echo "ALL STAGE1 SELF-TESTS PASSED ($*)"; else echo "SOME STAGE1 SELF-TESTS FAILED ($*)"; exit 1; fi
 
 
 #####################################################################
