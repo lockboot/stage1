@@ -50,6 +50,7 @@ jobs:
           path: |
             tools/build-uki/${{ matrix.arch }}/linux.efi
             tools/build-uki/${{ matrix.arch }}/linux.efi.sha256
+            tools/build-uki/${{ matrix.arch }}/measurements.json
             tools/build-uki/${{ matrix.arch }}/stage0-snippet.json
             tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/busybox
