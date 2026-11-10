@@ -312,17 +312,8 @@ echo "${UKI_SHA256}  linux.efi" > "${OUTPUT_DIR}/linux.efi.sha256"
 python3 "${SCRIPT_DIR}/../predict-pcrs.py" --uki "${UKI_PATH}" \
     --replay "${OUTPUT_DIR}/stage1.replay.json"
 
-# Ready-to-paste _stage1 user-data snippet (sha256 admission mode). Deployers who
-# want signed-mode rollforward re-sign linux.efi with their own ed25519 key.
-cat > "${OUTPUT_DIR}/stage0-snippet.json" <<SNIPPET
-{
-  "_stage1": {
-    "${ARCH}": { "url": "https://YOUR-HOST/path/to/linux.efi", "sha256": "${UKI_SHA256}" }
-  }
-}
-SNIPPET
 echo "UKI sha256: ${UKI_SHA256}"
-echo "Wrote ${OUTPUT_DIR}/linux.efi.sha256 and ${OUTPUT_DIR}/stage0-snippet.json"
+echo "Wrote ${OUTPUT_DIR}/linux.efi.sha256"
 
 # Clean up temporary extraction directory
 rm -rf "${OUTPUT_DIR}/tmp"

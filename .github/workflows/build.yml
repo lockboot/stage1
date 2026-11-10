@@ -34,14 +34,14 @@ jobs:
 
       # Build the netboot UKI and the example-stage2 leaf for every push/PR/tag. One
       # `make` builds the docker build-image once (docker-build-base) and produces:
-      #   tools/build-uki/<arch>/linux.efi (+ .sha256, snippet, os-release, busybox, stage1)
+      #   tools/build-uki/<arch>/linux.efi (+ .sha256, os-release, busybox, stage1)
       #   build/<arch>/stage2 (the example leaf payload)
       # No workspace / sibling repos needed: vaportpm is pulled from git, stage0 is not
       # a build-time dependency (it netboots the UKI at runtime).
       - name: Build UKI + example-stage2 for ${{ matrix.arch }}
         run: make ${{ matrix.arch }} stage2-${{ matrix.arch }}
 
-      # UKI (stage1) track: the netboot payload + its sha256 pin + the _stage1 snippet,
+      # UKI (stage1) track: the netboot payload + its sha256 pin,
       # busybox/stage1 for the runtime image, and the example-stage2 leaf.
       - name: Upload UKI artifacts for ${{ matrix.arch }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -51,7 +51,6 @@ jobs:
             tools/build-uki/${{ matrix.arch }}/linux.efi
             tools/build-uki/${{ matrix.arch }}/linux.efi.sha256
             tools/build-uki/${{ matrix.arch }}/stage1.replay.json
-            tools/build-uki/${{ matrix.arch }}/stage0-snippet.json
             tools/build-uki/${{ matrix.arch }}/os-release
             tools/build-uki/${{ matrix.arch }}/busybox
             tools/build-uki/${{ matrix.arch }}/stage1
