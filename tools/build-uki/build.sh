@@ -222,14 +222,20 @@ UKI_PATH="${OUTPUT_DIR}/linux.efi"
 #   randomize_kstack_offset=on - Randomize kernel stack offset per syscall; makes stack-based exploits less reliable
 #   page_alloc.shuffle=1      - Randomize page allocator freelists; makes heap layout less predictable
 #   init_on_alloc=1           - Zero-fill memory on allocation; prevents info leaks from recycled memory
-#   init_on_free=1            - Zero-fill memory on free; makes use-after-free exploitation harder
+#
+# NOT used: init_on_free=1 (zero-fill on free). On GCE Intel TDX (c3, 2026-11) it kills the TD during
+# early boot every time -- a silent reset at varying points (ACPI parsing, the boot-time "mem
+# auto-init: clearing system memory", swiotlb conversion); found by bisecting this cmdline, every
+# other option here is fine there. Cause not understood yet. init_on_alloc=1 still zeroes every
+# allocation; what is lost is wiping freed data at free time, which the confidential-VM memory
+# encryption (SEV-SNP / TDX) already covers against the host.
 #   crashkernel=0             - Reserve no memory for kdump; prevents crash dumps even if NMI is sent via cloud API
 #   vsyscall=none             - (x86_64 only) Remove legacy vsyscall page; eliminates a fixed-address ROP gadget
 #
 # NOTE: SysRq is disabled via /proc/sys/kernel/sysrq in the init script, not here.
 # "sysrq=" is not a valid kernel cmdline parameter (the kernel ignores it).
 CMDLINE_PATH="${OUTPUT_DIR}/cmdline.txt"
-CMDLINE_COMMON="earlycon hibernate=no lockdown=confidentiality debugfs=off oops=panic crashkernel=0 iommu.strict=1 slab_nomerge randomize_kstack_offset=on page_alloc.shuffle=1 init_on_alloc=1 init_on_free=1 ro"
+CMDLINE_COMMON="earlycon hibernate=no lockdown=confidentiality debugfs=off oops=panic crashkernel=0 iommu.strict=1 slab_nomerge randomize_kstack_offset=on page_alloc.shuffle=1 init_on_alloc=1 ro"
 if [ "${ARCH}" = "x86_64" ]; then
     # console=ttyS0: EC2 PCI UART (only serial device, gets ttyS0)
     # console=ttyS1: QEMU q35 ISA serial (default COM1 is ttyS0 with no backend,
