@@ -52,6 +52,11 @@ ci: docker-build-base
 fmt-fix: docker-build-base ## Apply rustfmt across the whole workspace (no --check)
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) cargo fmt --all
 
+# Re-resolve Cargo.lock's vaportpm-attest entry to the rev in Cargo.toml (after bumping it).
+.PHONY: update-vaportpm
+update-vaportpm: docker-build-base
+	$(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) cargo update -p vaportpm-attest
+
 
 #####################################################################
 # UKI build (stage0 serves linux.efi over the network and admits it by
