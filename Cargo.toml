@@ -19,10 +19,9 @@ libc = "0.2"
 ed25519-compact = { version = "2", default-features = false }
 
 # Pinned to an immutable SHA + a `version` guard (the build fails if the rev drifts to a commit
-# whose crate version isn't 0.3.0). Currently the vaportpm `gpt-digest` branch (lockboot/vaportpm#13,
-# unreleased); move to the next release commit and bump the guard once it is cut. After changing
-# the rev, `make update-vaportpm` re-resolves Cargo.lock.
-vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", rev = "8b2c35c22829852bdd570eb5296499cd5f4f7c95", version = "=0.3.0" }
+# whose crate version isn't 0.4.1): the vaportpm v0.4.1 release commit. After changing the rev,
+# `make update-vaportpm` re-resolves Cargo.lock.
+vaportpm-attest = { git = "https://github.com/lockboot/vaportpm", rev = "157ec04bf2efafc9d096dd063c904d9739156a86", version = "=0.4.1" }
 
 reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "rustls-tls-webpki-roots-no-provider"] }
 rustls = { version = "=0.23.23", default-features = false, features = ["std", "tls12"] }
