@@ -41,20 +41,21 @@ jobs:
       - name: Build UKI + example-stage2 for ${{ matrix.arch }}
         run: make ${{ matrix.arch }} stage2-${{ matrix.arch }}
 
-      # UKI (stage1) track: the netboot payload + its sha256 pin,
-      # busybox/stage1 for the runtime image, and the example-stage2 leaf.
+      # UKI (stage1) track: the netboot payload + its sha256 pin, busybox/stage1 for the runtime
+      # image, and the example-stage2 leaf. Collected into one directory so the artifact holds
+      # exactly these files at its root: upload-artifact roots an artifact at the common ancestor
+      # of its paths, and the release zip and release-docker's download both take that layout.
+      - name: Collect release files for ${{ matrix.arch }}
+        run: |
+          mkdir -p dist/${{ matrix.arch }}
+          cp tools/build-uki/${{ matrix.arch }}/{linux.efi,linux.efi.sha256,stage1.replay.json,os-release,busybox,stage1} \
+             build/${{ matrix.arch }}/stage2 dist/${{ matrix.arch }}/
+
       - name: Upload UKI artifacts for ${{ matrix.arch }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: uki-${{ matrix.arch }}
-          path: |
-            tools/build-uki/${{ matrix.arch }}/linux.efi
-            tools/build-uki/${{ matrix.arch }}/linux.efi.sha256
-            tools/build-uki/${{ matrix.arch }}/stage1.replay.json
-            tools/build-uki/${{ matrix.arch }}/os-release
-            tools/build-uki/${{ matrix.arch }}/busybox
-            tools/build-uki/${{ matrix.arch }}/stage1
-            build/${{ matrix.arch }}/stage2
+          path: dist/${{ matrix.arch }}/*
 
   # ---- UKI (stage1) release track (tag: v*) ----------------------------
   release-uki:
@@ -98,17 +99,25 @@ jobs:
         with:
           subject-checksums: subjects.sha256
 
-      - name: Create UKI release
+      # Created as a draft with its assets, then published: a release is immutable from the
+      # moment it is published (repo setting, workspace tools/rulesets.sh) and then accepts no
+      # uploads, so publishing first leaves it empty (as vaportpm v0.4.0 was).
+      - name: Create draft UKI release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ github.ref_name }}
           files: |
             uki-x86_64.zip
             uki-aarch64.zip
-          draft: false
+          draft: true
           prerelease: true
           generate_release_notes: true
           make_latest: true
+
+      - name: Publish UKI release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" -R "${{ github.repository }}" --draft=false
 
   # ---- stage1 runtime container image (tag: v*) ------------------------
   # Minimal busybox + stage1 utility image; belongs to the stage1/UKI track.
@@ -137,6 +146,10 @@ jobs:
         with:
           name: uki-aarch64
           path: tools/build-uki/aarch64
+
+      # Dockerfile.runtime's builder stage runs commands for each target platform.
+      - name: Set up QEMU (arm64 layers on the amd64 runner)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0

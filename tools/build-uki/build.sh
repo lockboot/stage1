@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Get architecture from environment (default to x86_64)
 ARCH=${ARCH:-x86_64}
 
-echo "=== Building UKI for Fedora 41 (${ARCH}) ==="
+echo "=== Building UKI (${ARCH}) ==="
 
 # Output directory (same as dependencies - everything self-contained)
 OUTPUT_DIR="${SCRIPT_DIR}/${ARCH}"
@@ -20,18 +20,30 @@ if [ "${ARCH}" != "x86_64" ] && [ "${ARCH}" != "aarch64" ]; then
     exit 1
 fi
 
-# Use systemd-boot stub extracted by Makefile from Fedora 41 RPM (systemd v256)
+# Use the systemd-boot stub the Makefile extracted from the Fedora RPM fedora-deps.mk pins
 if [ ! -f "${OUTPUT_DIR}/stub.efi" ]; then
     echo "ERROR: systemd-boot stub not found at ${OUTPUT_DIR}/stub.efi"
     echo "Please run 'make tools/build-uki/${ARCH}/stub.efi' first"
     exit 1
 fi
 
-echo "Extracting kernel-core RPM (vmlinuz)..."
-rpm2cpio "${OUTPUT_DIR}"/kernel-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+# The kernel is exactly the one fedora-deps.mk pins, never "whichever RPM is in the directory":
+# a bump leaves the previous version's RPMs behind until update-fedora-deps.py removes them.
+KERNEL_NVR=$(sed -n 's/^FEDORA_KERNEL_VERSION := //p' "${SCRIPT_DIR}/fedora-deps.mk")
+[ -n "${KERNEL_NVR}" ] || { echo "ERROR: FEDORA_KERNEL_VERSION not found in fedora-deps.mk"; exit 1; }
+# The kernel's dist tag (fc44 in 7.2.11-200.fc44) names the Fedora release in os-release.
+FEDORA_DIST="${KERNEL_NVR##*.}"
+KERNEL_CORE_RPM="${OUTPUT_DIR}/kernel-core-${KERNEL_NVR}.${ARCH}.rpm"
+KERNEL_MODULES_RPM="${OUTPUT_DIR}/kernel-modules-core-${KERNEL_NVR}.${ARCH}.rpm"
+for rpm in "${KERNEL_CORE_RPM}" "${KERNEL_MODULES_RPM}"; do
+    [ -f "${rpm}" ] || { echo "ERROR: pinned RPM not found: ${rpm}"; exit 1; }
+done
 
-echo "Extracting kernel-modules-core RPM (core drivers including gve and ena)..."
-rpm2cpio "${OUTPUT_DIR}"/kernel-modules-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+echo "Extracting $(basename "${KERNEL_CORE_RPM}") (vmlinuz)..."
+rpm2cpio "${KERNEL_CORE_RPM}" | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+
+echo "Extracting $(basename "${KERNEL_MODULES_RPM}") (core drivers including gve and ena)..."
+rpm2cpio "${KERNEL_MODULES_RPM}" | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
 
 if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
     echo "ERROR: kernel modules directory not found after extraction!"
@@ -39,8 +51,10 @@ if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
 fi
 echo "Kernel and modules extracted successfully"
 
-# Find the installed kernel version
-KERNEL_VERSION=$(ls "${OUTPUT_DIR}/tmp/lib/modules/" | head -n1)
+# The pinned kernel's module directory
+KERNEL_VERSION="${KERNEL_NVR}.${ARCH}"
+[ -d "${OUTPUT_DIR}/tmp/lib/modules/${KERNEL_VERSION}" ] \
+    || { echo "ERROR: no modules for ${KERNEL_VERSION} in the extracted RPMs"; exit 1; }
 echo "Kernel version: ${KERNEL_VERSION}"
 
 # Extract kernel config
@@ -143,8 +157,8 @@ REQUIRED_MODULES=(
     # NVMe disk driver, so stage2 can see the persistent volume (EC2 EBS is NVMe;
     # the harness also attaches its disk as NVMe). Never needed to boot (initramfs +
     # in-memory payload), so it was previously absent. Dep chain, loaded in order by
-    # init: hkdf -> nvme-auth, nvme-keyring -> nvme-core -> nvme.
-    "crypto/hkdf.ko"
+    # init: nvme-auth, nvme-keyring -> nvme-core -> nvme. (Up to kernel 7.0 nvme-auth also
+    # needed crypto/hkdf.ko, which 7.2 no longer has.)
     "drivers/nvme/common/nvme-auth.ko"
     "drivers/nvme/common/nvme-keyring.ko"
     "drivers/nvme/host/nvme-core.ko"
@@ -251,15 +265,16 @@ echo "${CMDLINE_SERIAL} ${CMDLINE_COMMON}" > "${CMDLINE_PATH}"
 # Set SOURCE_DATE_EPOCH for reproducible builds
 export SOURCE_DATE_EPOCH=0
 
-# Generate version with year.month format (e.g., 26.02)
-YEAR_MONTH=$(date +%y.%m)
-OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Fedora 41)"
+# Version in year.month format (e.g., 26.02): the built commit's committer date, from the Makefile.
+# Never the build date: os-release is embedded in the UKI, so it would change the measured bytes.
+YEAR_MONTH="${COMMIT_YEAR_MONTH:?set COMMIT_YEAR_MONTH (yy.mm of the commit being built; the Makefile does)}"
+OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Fedora ${FEDORA_DIST#fc})"
 OSREL_NAME="Lock.Boot"
 # Combine stub + kernel + initrd into UKI
 # Use os-release from extracted RPM if available, otherwise create minimal one
 OSREL_PATH="${OUTPUT_DIR}/os-release"
 echo "ID=lockboot" > "${OSREL_PATH}"
-echo "VERSION_ID=${YEAR_MONTH}.fc41" >> "${OSREL_PATH}"
+echo "VERSION_ID=${YEAR_MONTH}.${FEDORA_DIST}" >> "${OSREL_PATH}"
 echo "VERSION=\"${OSREL_VERSION}\"" >> "${OSREL_PATH}"
 echo "NAME=\"${OSREL_NAME}\"" >> "${OSREL_PATH}"
 echo "PRETTY_NAME=\"${OSREL_NAME} ${OSREL_VERSION}\"" >> "${OSREL_PATH}"

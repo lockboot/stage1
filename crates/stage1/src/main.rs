@@ -15,6 +15,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+mod bootdisk;
+
 use vaportpm_attest as tpm;
 use vaportpm_attest::{PcrOps, Tpm};
 
@@ -76,7 +78,7 @@ fn main_inner() -> Result<()> {
                 .to_string()
                 .into_bytes()
         };
-        println!("{}", tpm::attest(&nonce)?);
+        println!("{}", tpm::attest(&nonce, &bootdisk::gpt_digests()?)?);
         return Ok(());
     }
 
@@ -179,7 +181,7 @@ fn parse_json_to_config(data: Vec<u8>) -> Result<ParsedData> {
 /// does not yet contain it). Code only — config is deliberately not bound.
 fn generate_pre_execution_attestation(binary_data: &[u8]) -> Result<()> {
     let path = format!("{}/stage1.attest", TMP_DIR);
-    let contents = tpm::attest(&sha256!(binary_data))?;
+    let contents = tpm::attest(&sha256!(binary_data), &bootdisk::gpt_digests()?)?;
     fs::write(&path, contents).context(format!("Failed to write attestation to {}", &path))?;
     Ok(())
 }
