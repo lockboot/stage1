@@ -143,6 +143,25 @@ def download_verify_sha256(binrpm, srcname, nvr, arch, keyfile, sigkey):
         return h.hexdigest()
 
 
+def remove_previous(nvr_for):
+    """Remove what earlier pins left in the per-arch build dirs: RPMs of other versions, and the
+    files derived from them (the *.rpm symlinks, stub.efi). Otherwise make sees them as up to date
+    (a downloaded RPM keeps the server's mtime) and the next build silently reuses the old ones."""
+    for arch in ARCHES:
+        d = os.path.join(HERE, arch)
+        if not os.path.isdir(d):
+            continue
+        keep = {f"{binrpm}-{nvr_for[srcname]}.{arch}.rpm" for _, binrpm, srcname in PACKAGES}
+        stale = [n for n in os.listdir(d)
+                 if any(n.startswith(binrpm + "-") and n.endswith(".rpm") for _, binrpm, _ in PACKAGES)
+                 and n not in keep]
+        stale += [n for n in ("kernel-core.rpm", "kernel-modules-core.rpm", "stub.efi")
+                  if os.path.lexists(os.path.join(d, n))]
+        for n in sorted(stale):
+            os.remove(os.path.join(d, n))
+            print(f"removed {arch}/{n}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Regenerate fedora-deps.mk (GPG-verified kernel + stub pins).")
     ap.add_argument("--fcos", help="Fedora CoreOS build version, e.g. 44.20260621.3.1")
@@ -200,6 +219,7 @@ def main():
             for arch in ARCHES:
                 f.write(f"{stem}_SHA256_{arch} := {shas[f'{stem}_SHA256_{arch}']}\n")
     print(f"wrote {out}")
+    remove_previous(nvr_for)
 
 
 if __name__ == "__main__":

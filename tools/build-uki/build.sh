@@ -27,11 +27,21 @@ if [ ! -f "${OUTPUT_DIR}/stub.efi" ]; then
     exit 1
 fi
 
-echo "Extracting kernel-core RPM (vmlinuz)..."
-rpm2cpio "${OUTPUT_DIR}"/kernel-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+# The kernel is exactly the one fedora-deps.mk pins, never "whichever RPM is in the directory":
+# a bump leaves the previous version's RPMs behind until update-fedora-deps.py removes them.
+KERNEL_NVR=$(sed -n 's/^FEDORA_KERNEL_VERSION := //p' "${SCRIPT_DIR}/fedora-deps.mk")
+[ -n "${KERNEL_NVR}" ] || { echo "ERROR: FEDORA_KERNEL_VERSION not found in fedora-deps.mk"; exit 1; }
+KERNEL_CORE_RPM="${OUTPUT_DIR}/kernel-core-${KERNEL_NVR}.${ARCH}.rpm"
+KERNEL_MODULES_RPM="${OUTPUT_DIR}/kernel-modules-core-${KERNEL_NVR}.${ARCH}.rpm"
+for rpm in "${KERNEL_CORE_RPM}" "${KERNEL_MODULES_RPM}"; do
+    [ -f "${rpm}" ] || { echo "ERROR: pinned RPM not found: ${rpm}"; exit 1; }
+done
 
-echo "Extracting kernel-modules-core RPM (core drivers including gve and ena)..."
-rpm2cpio "${OUTPUT_DIR}"/kernel-modules-core-*.rpm | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+echo "Extracting $(basename "${KERNEL_CORE_RPM}") (vmlinuz)..."
+rpm2cpio "${KERNEL_CORE_RPM}" | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
+
+echo "Extracting $(basename "${KERNEL_MODULES_RPM}") (core drivers including gve and ena)..."
+rpm2cpio "${KERNEL_MODULES_RPM}" | (cd "${OUTPUT_DIR}/tmp" && cpio --quiet -idmu)
 
 if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
     echo "ERROR: kernel modules directory not found after extraction!"
@@ -39,8 +49,10 @@ if [ ! -d "${OUTPUT_DIR}/tmp/lib/modules" ]; then
 fi
 echo "Kernel and modules extracted successfully"
 
-# Find the installed kernel version
-KERNEL_VERSION=$(ls "${OUTPUT_DIR}/tmp/lib/modules/" | head -n1)
+# The pinned kernel's module directory
+KERNEL_VERSION="${KERNEL_NVR}.${ARCH}"
+[ -d "${OUTPUT_DIR}/tmp/lib/modules/${KERNEL_VERSION}" ] \
+    || { echo "ERROR: no modules for ${KERNEL_VERSION} in the extracted RPMs"; exit 1; }
 echo "Kernel version: ${KERNEL_VERSION}"
 
 # Extract kernel config
@@ -143,8 +155,8 @@ REQUIRED_MODULES=(
     # NVMe disk driver, so stage2 can see the persistent volume (EC2 EBS is NVMe;
     # the harness also attaches its disk as NVMe). Never needed to boot (initramfs +
     # in-memory payload), so it was previously absent. Dep chain, loaded in order by
-    # init: hkdf -> nvme-auth, nvme-keyring -> nvme-core -> nvme.
-    "crypto/hkdf.ko"
+    # init: nvme-auth, nvme-keyring -> nvme-core -> nvme. (Up to kernel 7.0 nvme-auth also
+    # needed crypto/hkdf.ko, which 7.2 no longer has.)
     "drivers/nvme/common/nvme-auth.ko"
     "drivers/nvme/common/nvme-keyring.ko"
     "drivers/nvme/host/nvme-core.ko"

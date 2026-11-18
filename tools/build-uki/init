@@ -85,7 +85,6 @@ mod netfs
 mod erofs
 
 # NVMe disk driver (EC2 EBS + the harness disk are NVMe). Deps in order.
-mod hkdf
 mod nvme-auth
 mod nvme-keyring
 mod nvme-core
