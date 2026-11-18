@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Get architecture from environment (default to x86_64)
 ARCH=${ARCH:-x86_64}
 
-echo "=== Building UKI for Fedora 41 (${ARCH}) ==="
+echo "=== Building UKI (${ARCH}) ==="
 
 # Output directory (same as dependencies - everything self-contained)
 OUTPUT_DIR="${SCRIPT_DIR}/${ARCH}"
@@ -20,7 +20,7 @@ if [ "${ARCH}" != "x86_64" ] && [ "${ARCH}" != "aarch64" ]; then
     exit 1
 fi
 
-# Use systemd-boot stub extracted by Makefile from Fedora 41 RPM (systemd v256)
+# Use the systemd-boot stub the Makefile extracted from the Fedora RPM fedora-deps.mk pins
 if [ ! -f "${OUTPUT_DIR}/stub.efi" ]; then
     echo "ERROR: systemd-boot stub not found at ${OUTPUT_DIR}/stub.efi"
     echo "Please run 'make tools/build-uki/${ARCH}/stub.efi' first"
@@ -31,6 +31,8 @@ fi
 # a bump leaves the previous version's RPMs behind until update-fedora-deps.py removes them.
 KERNEL_NVR=$(sed -n 's/^FEDORA_KERNEL_VERSION := //p' "${SCRIPT_DIR}/fedora-deps.mk")
 [ -n "${KERNEL_NVR}" ] || { echo "ERROR: FEDORA_KERNEL_VERSION not found in fedora-deps.mk"; exit 1; }
+# The kernel's dist tag (fc44 in 7.2.11-200.fc44) names the Fedora release in os-release.
+FEDORA_DIST="${KERNEL_NVR##*.}"
 KERNEL_CORE_RPM="${OUTPUT_DIR}/kernel-core-${KERNEL_NVR}.${ARCH}.rpm"
 KERNEL_MODULES_RPM="${OUTPUT_DIR}/kernel-modules-core-${KERNEL_NVR}.${ARCH}.rpm"
 for rpm in "${KERNEL_CORE_RPM}" "${KERNEL_MODULES_RPM}"; do
@@ -263,15 +265,16 @@ echo "${CMDLINE_SERIAL} ${CMDLINE_COMMON}" > "${CMDLINE_PATH}"
 # Set SOURCE_DATE_EPOCH for reproducible builds
 export SOURCE_DATE_EPOCH=0
 
-# Generate version with year.month format (e.g., 26.02)
-YEAR_MONTH=$(date +%y.%m)
-OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Fedora 41)"
+# Version in year.month format (e.g., 26.02): the built commit's committer date, from the Makefile.
+# Never the build date: os-release is embedded in the UKI, so it would change the measured bytes.
+YEAR_MONTH="${COMMIT_YEAR_MONTH:?set COMMIT_YEAR_MONTH (yy.mm of the commit being built; the Makefile does)}"
+OSREL_VERSION="${YEAR_MONTH} ${ARCH} (Fedora ${FEDORA_DIST#fc})"
 OSREL_NAME="Lock.Boot"
 # Combine stub + kernel + initrd into UKI
 # Use os-release from extracted RPM if available, otherwise create minimal one
 OSREL_PATH="${OUTPUT_DIR}/os-release"
 echo "ID=lockboot" > "${OSREL_PATH}"
-echo "VERSION_ID=${YEAR_MONTH}.fc41" >> "${OSREL_PATH}"
+echo "VERSION_ID=${YEAR_MONTH}.${FEDORA_DIST}" >> "${OSREL_PATH}"
 echo "VERSION=\"${OSREL_VERSION}\"" >> "${OSREL_PATH}"
 echo "NAME=\"${OSREL_NAME}\"" >> "${OSREL_PATH}"
 echo "PRETTY_NAME=\"${OSREL_NAME} ${OSREL_VERSION}\"" >> "${OSREL_PATH}"

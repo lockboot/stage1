@@ -79,8 +79,13 @@ tools/build-uki/%/kernel-modules-core.rpm: docker-build-base
 
 # Build the netboot UKI (linux.efi) for a specific architecture. build.sh extracts
 # a rootfs via the HOST docker daemon, so DOCKER_OPT_DOCKER forwards the socket.
+#
+# The UKI embeds an os-release whose version is yy.mm. It is taken from the committer date (UTC)
+# of the commit being built, not from the build date, so a commit builds the same UKI in any
+# month. Read here because the build image has no git.
+COMMIT_YEAR_MONTH := $(shell TZ=UTC git log -1 --format=%cd --date=format-local:%y.%m)
 tools/build-uki/%/linux.efi: tools/build-uki/%/busybox tools/build-uki/%/stage1 tools/build-uki/%/stub.efi tools/build-uki/%/kernel-core.rpm tools/build-uki/%/kernel-modules-core.rpm tools/build-uki/mkuki
-	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* \
+	$(DOCKER_RUN) $(DOCKER_OPT_DOCKER) -e ARCH=$* -e COMMIT_YEAR_MONTH=$(COMMIT_YEAR_MONTH) \
 		$(BUILD_IMAGE) ./tools/build-uki/build.sh
 
 # Build AND extract stage1 inside the one container step, so the cp runs where
